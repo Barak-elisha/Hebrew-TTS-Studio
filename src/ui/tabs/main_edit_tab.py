@@ -2,6 +2,7 @@ import os
 import re
 import difflib
 import PyPDF2
+import fitz  # PyMuPDF
 from datetime import datetime
 from collections import Counter
 
@@ -20,7 +21,7 @@ from src.workers.telegram_worker import TelegramWorker
 from src.ui.dialogs.compare_dialog import AnalysisDialog
 from src.ui.dialogs.split_dialog import SplitExportDialog
 from src.ui.dialogs.advanced_import import AdvancedImportDialog
-from src.utils.text_tools import advanced_cleanup
+from src.utils.text_tools import advanced_cleanup, cleanup_pdf_page
 
 class MainEditTab(QWidget):
     def __init__(self, parent=None):
@@ -178,47 +179,69 @@ class MainEditTab(QWidget):
     # ==========================
 
     def load_pdf(self):
-        fnames, _ = QFileDialog.getOpenFileNames(self, 'בחר קבצי PDF', '', "PDF Files (*.pdf)")
+        # שימוש ב-getOpenFileNames (ברבים) במקום getOpenFileName
+        last_dir = os.path.dirname(self.file_path) if self.file_path else ''
+        fnames, _ = QFileDialog.getOpenFileNames(self, 'בחר קבצי PDF (ניתן לבחור כמה)', last_dir, "PDF Files (*.pdf)")
+
         if fnames:
-            self.file_paths = sorted(fnames)
+            # הוספה לרשימה קיימת (לתמיכה בייבוא מתיקיות שונות)
+            self.file_paths.extend(fnames)
+            # הסרת כפילויות תוך שמירה על סדר
+            seen = set()
+            unique = []
+            for f in self.file_paths:
+                if f not in seen:
+                    seen.add(f)
+                    unique.append(f)
+            self.file_paths = unique
             self.file_path = self.file_paths[0]
-            
+
+            # עדכון התצוגה למשתמש
             if len(self.file_paths) == 1:
-                self.lbl_file.setText(os.path.basename(self.file_path))
+                self.lbl_file.setText(os.path.basename(self.file_paths[0]))
             else:
                 self.lbl_file.setText(f"נבחרו {len(self.file_paths)} קבצים")
-            
-            total_pages = 0
+
+            # חישוב סך העמודים מכל הקבצים יחד
+            total_pages_count = 0
             for f in self.file_paths:
                 try:
-                    with open(f, 'rb') as pdf: total_pages += len(PyPDF2.PdfReader(pdf).pages)
+                    with open(f, 'rb') as pdf_file:
+                        reader = PyPDF2.PdfReader(pdf_file)
+                        total_pages_count += len(reader.pages)
                 except: pass
-            
+
             self.input_start.setText("1")
-            self.input_end.setText(str(total_pages))
-            self.input_filename.setText(os.path.splitext(os.path.basename(self.file_path))[0])
+            self.input_end.setText(str(total_pages_count))
+            clean_name = os.path.splitext(os.path.basename(self.file_paths[0]))[0]
+            self.input_filename.setText(clean_name)
 
     def extract_text(self):
-        if not self.file_paths:
-            QMessageBox.warning(self, "שגיאה", "לאנבחרו קבצים.")
+        """
+        גרסה משופרת הכוללת ניקוי מתקדם של פיסוק, סוגריים ואיחוד פסקאות חכם.
+        """
+        if not hasattr(self, 'file_paths') or not self.file_paths:
+            QMessageBox.warning(self, "שגיאה", "לא נבחרו קבצים.")
             return
 
-        self.main_window.lbl_status.setText("מייבא טקסט...")
-        if self.main_window.progress_bar: self.main_window.progress_bar.setValue(0)
-        
+        self.main_window.lbl_status.setText("מייבא טקסט ומבצע ניקוי מתקדם...")
+        self.main_window.progress_bar.setValue(0)
+
         if hasattr(self, 'pdf_viewer'):
             self.pdf_viewer.load_pdf(self.file_paths[0])
 
-        full_text = ""
+        full_text_accumulator = ""
         total_files = len(self.file_paths)
 
         try:
             for idx, f_path in enumerate(self.file_paths):
                 try:
-                    reader = PyPDF2.PdfReader(f_path)
-                    total_pages = len(reader.pages)
-                except: continue
-                
+                    doc = fitz.open(f_path)
+                    total_pages = len(doc)
+                except Exception as e:
+                    print(f"Error reading PDF {f_path}: {e}")
+                    continue
+
                 txt_start = self.input_start.text().strip() or "1"
                 txt_end = self.input_end.text().strip() or str(total_pages)
                 start_p = max(1, int(txt_start))
@@ -226,22 +249,94 @@ class MainEditTab(QWidget):
 
                 for i in range(start_p - 1, end_p):
                     page_num = i + 1
-                    full_text += f"\n\n[PAGE:{page_num}]\n"
-                    page_text = reader.pages[i].extract_text()
+                    full_text_accumulator += f"\n\n[PAGE:{page_num}]\n"
+
+                    page_text = doc[i].get_text()
+
                     if page_text:
-                        # Simple cleanup (expand as needed from your original code)
-                        full_text += page_text
+                        # === שלב 1: ניקוי שורות זבל ===
+                        lines = page_text.split('\n')
+                        cleaned_lines = []
+                        for line in lines:
+                            stripped = line.strip()
+                            if re.match(r'^\s*\d+\s*$', stripped):
+                                continue
+                            if len(stripped) < 2 and stripped not in ['.', '!', '?', ',', ')', '(']:
+                                continue
+                            cleaned_lines.append(stripped)
 
-                if self.main_window.progress_bar: 
-                    self.main_window.progress_bar.setValue(int(((idx + 1) / total_files) * 100))
+                        # === שלב 1.5: תיקון סימני פיסוק RTL ===
+                        # ב-PDF עברי, PyMuPDF מחזיר לפעמים ".פינוייה" במקום "פינוייה."
+                        # כלומר סימן הפיסוק מופיע בתחילת השורה דבוק למילה הראשונה
+                        # התיקון מעביר את הסימן לסוף המילה שדבוקה אליו
+                        for k in range(len(cleaned_lines)):
+                            cleaned_lines[k] = re.sub(r'^([.!?,;:"\u05F4]+)(\S+)', r'\2\1', cleaned_lines[k])
+                        # תיקון סדר גרשיים-נקודה: word." -> word". (בעברית הגרשיים סוגרות לפני הנקודה)
+                        for k in range(len(cleaned_lines)):
+                            cleaned_lines[k] = re.sub(r'\.(")', r'\1.', cleaned_lines[k])
 
-            final_text = advanced_cleanup(full_text)
+                        # === שלב 1.6: איחוד שורות פיסוק/סוגריים בודדות לשורה הקודמת ===
+                        merged_lines = []
+                        for line in cleaned_lines:
+                            if merged_lines and re.match(r'^[.!?,;:)(–\-\]\[]+$', line):
+                                merged_lines[-1] += line
+                            else:
+                                merged_lines.append(line)
+                        cleaned_lines = merged_lines
+
+                        # === שלב 2: איחוד פסקאות חכם ===
+                        smart_text = ""
+                        for j, line in enumerate(cleaned_lines):
+                            # אם השורה מתחילה בסימן פיסוק - אל תוסיף רווח לפניה
+                            if j > 0:
+                                prev_line = cleaned_lines[j-1]
+                                current_starts_with_punct = line and line[0] in '.!?,;:'
+                                
+                                if current_starts_with_punct:
+                                    # אל תוסיף רווח - הנקודה תידבק למילה הקודמת
+                                    pass
+                                elif prev_line.endswith(('.', '!', '?', ':', ';', '"')):
+                                    smart_text += "\n"
+                                else:
+                                    smart_text += " "
+                            
+                            smart_text += line
+
+                        full_text_accumulator += smart_text
+
+                doc.close()
+                self.main_window.progress_bar.setValue(int(((idx + 1) / total_files) * 100))
+
+            # === שלב 3: פוליש סופי ===
+            final_text = advanced_cleanup(full_text_accumulator)
+            
+            # תיקון: נקודה דבוקה למילה עברית - הוסף רווח אחרי הנקודה
+            # דוגמה: "פינוייה.כלומר" → "פינוייה. כלומר"
+            final_text = re.sub(r'\.([^\s\n])', r'. \1', final_text)
+            
+            # תיקון: פסיק דבוק למילה - הוסף רווח אחרי
+            final_text = re.sub(r',([^\s\n])', r', \1', final_text)
+            
+            # תיקון: רווחים מרובים
+            final_text = re.sub(r' {2,}', ' ', final_text)
+            
+            # תיקון: רווחים לפני סימני פיסוק
+            final_text = re.sub(r'\s+([.,!?;:])', r'\1', final_text)
+
+            # תיקון: רווחים מיותרים בתוך סוגריים
+            final_text = re.sub(r'\(\s+', '(', final_text)
+            final_text = re.sub(r'\s+\)', ')', final_text)
+
             self.editor.setPlainText(final_text.strip())
-            self.main_window.lbl_status.setText("הייבוא הושלם!")
-            self.sync_pdf_to_cursor()
+            self.main_window.lbl_status.setText("הייבוא הושלם! (טקסט עבר סידור וניקוי)")
+
+            if hasattr(self, 'sync_pdf_to_cursor'):
+                self.sync_pdf_to_cursor()
 
         except Exception as e:
-            QMessageBox.critical(self, "שגיאה בייבוא", f"תקלה: {str(e)}")
+            QMessageBox.critical(self, "שגיאה בייבוא", f"תקלה בחילוץ: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def start_export_process(self):
         text = self.editor.toPlainText()
@@ -261,16 +356,17 @@ class MainEditTab(QWidget):
         self.btn_convert.setText("מייצא... (מעבד)")
         self.main_window.lbl_status.setText(f"שומר ל: {file_name}")
         
-        voice_key = self.combo_he.currentText() # You might need logic to map name to ID
+        voice_name = self.combo_he.currentText()
+        voice_key = self.he_voices.get(voice_name, "he-IL-HilaNeural")
         rate = self.combo_speed.currentText()
-        
+
         # Access settings via main_window
         current_dict = self.main_window.settings.get("nikud_dictionary", {})
 
         self.tts_worker = TTSWorker(
             text=text,
             output_file=save_path,
-            voice=voice_key, # Ensure this sends the ID, not the name if needed
+            voice=voice_key,
             rate=rate,
             volume="+0%",
             dicta_dict=current_dict,
@@ -330,7 +426,7 @@ class MainEditTab(QWidget):
         # שחזור מצב הכפתורים
         self.btn_nikud_auto.setEnabled(True)
         self.btn_nikud_auto.setText("✨ ניקוד אוטומטי (Dicta)")
-        self.progress_bar.setValue(100)
+        self.main_window.progress_bar.setValue(100)
         
         # 1. שליפת הטקסט המקורי בצורה בטוחה (כולל תגיות תמונה) לצורך השוואה
         original_text = self.get_text_safe()
@@ -616,8 +712,8 @@ class MainEditTab(QWidget):
         כל שאר הטקסט נשאר ללא ניקוד/שינוי.
         """
         # 1. בדיקה שיש מילון
-        current_dict = self.settings.get("nikud_dictionary", {})
-        metadata = self.settings.get("nikud_metadata", {})
+        current_dict = self.main_window.settings.get("nikud_dictionary", {})
+        metadata = self.main_window.settings.get("nikud_metadata", {})
         
         if not current_dict:
             QMessageBox.information(self, "המילון ריק", "אין מילים במילון האישי ליישום.")
@@ -764,7 +860,7 @@ class MainEditTab(QWidget):
             self.main_window.lbl_status.setText("✅ כל הקבצים בתור עובדו בהצלחה!")
             self.btn_convert.setEnabled(True)
             self.btn_split_export.setEnabled(True)
-            self.progress_bar.setValue(100)
+            self.main_window.progress_bar.setValue(100)
             QMessageBox.information(self, "סיום", f"הסתיים עיבוד של {self.total_batch_size} קבצים.")
             return
 
@@ -773,7 +869,7 @@ class MainEditTab(QWidget):
         
         self.current_batch_task = task
         self.main_window.lbl_status.setText(f"מעבד חלק {task['index']}/{task['total']}: {os.path.basename(task['path'])}...")
-        self.progress_bar.setValue(0)
+        self.main_window.progress_bar.setValue(0)
         
         # נעילת כפתורים
         self.btn_convert.setEnabled(False)
@@ -781,9 +877,11 @@ class MainEditTab(QWidget):
 
         # הרצת ה-Worker (כמו בייצוא רגיל)
         voice_key = "he-IL-HilaNeural"
-        if hasattr(self, 'combo_he'): voice_key = self.combo_he.currentText()
+        if hasattr(self, 'combo_he'):
+            voice_name = self.combo_he.currentText()
+            voice_key = self.he_voices.get(voice_name, "he-IL-HilaNeural")
         rate = self.combo_speed.currentText()
-        current_dict = self.settings.get("nikud_dictionary", {})
+        current_dict = self.main_window.settings.get("nikud_dictionary", {})
 
         self.tts_worker = TTSWorker(
             text=task['text'],
@@ -797,7 +895,7 @@ class MainEditTab(QWidget):
 
         # שים לב: אנחנו מחברים לפונקציה מיוחדת שיודעת להמשיך את התור
         self.tts_worker.finished_success.connect(self.on_batch_part_finished)
-        self.tts_worker.progress_update.connect(self.progress_bar.setValue)
+        self.tts_worker.progress_update.connect(self.main_window.progress_bar.setValue)
         self.tts_worker.error.connect(self.on_tts_error) # אפשר להוסיף טיפול שגיאות שממשיך הלאה
         
         self.tts_worker.start()

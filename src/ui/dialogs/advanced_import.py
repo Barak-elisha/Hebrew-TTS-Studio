@@ -2,11 +2,13 @@ import os
 import re
 import time
 import PyPDF2
+import fitz  # PyMuPDF
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, 
     QTableWidgetItem, QHeaderView, QPushButton, QFileDialog
 )
 from PyQt5.QtCore import Qt
+from src.utils.text_tools import cleanup_pdf_page
 
 class ProgressFileReader:
     def __init__(self, filename, callback):
@@ -172,34 +174,34 @@ class AdvancedImportDialog(QDialog):
             print(f"  - Range Text from Table: '{range_str}'")
             
             try:
-                with open(path, 'rb') as f:
-                    reader = PyPDF2.PdfReader(f)
-                    total_pages = len(reader.pages)
-                    print(f"  - PDF Total Pages: {total_pages}")
-                    
-                    # חישוב האינדקסים
-                    indices_to_extract = self.parse_page_string(range_str, total_pages)
-                    
-                    if not indices_to_extract:
-                        print("  - [WARNING] No pages selected for this row!")
-                    
-                    file_text = ""
-                    for idx in indices_to_extract:
-                        try:
-                            page_text = reader.pages[idx].extract_text()
-                            if page_text:
-                                lines = page_text.split('\n')
-                                filtered = [l for l in lines if not re.match(r'^\s*\d+\s*$', l)]
-                                file_text += " ".join(filtered) + " "
-                        except Exception as e_page:
-                            print(f"  - [ERROR] Failed to extract page index {idx}: {e_page}")
+                doc = fitz.open(path)
+                total_pages = len(doc)
+                print(f"  - PDF Total Pages: {total_pages}")
 
-                    full_text += file_text + "\n\n"
-                    print(f"  - Extracted {len(file_text)} chars from this row.")
-                    
+                # חישוב האינדקסים
+                indices_to_extract = self.parse_page_string(range_str, total_pages)
+
+                if not indices_to_extract:
+                    print("  - [WARNING] No pages selected for this row!")
+
+                file_text = ""
+                for idx in indices_to_extract:
+                    try:
+                        page_num = idx + 1
+                        file_text += f"\n\n[PAGE:{page_num}]\n"
+                        page_text = doc[idx].get_text()
+                        if page_text:
+                            file_text += cleanup_pdf_page(page_text)
+                    except Exception as e_page:
+                        print(f"  - [ERROR] Failed to extract page index {idx}: {e_page}")
+
+                doc.close()
+                full_text += file_text
+                print(f"  - Extracted {len(file_text)} chars from this row.")
+
             except Exception as e:
                 print(f"[ERROR] Failed to process row {i}: {e}")
         
-        self.result_text = re.sub(r'\s+', ' ', full_text).strip()
+        self.result_text = full_text.strip()
         print("--- [DEBUG] Finished Import ---\n")
         self.accept()
