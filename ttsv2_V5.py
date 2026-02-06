@@ -42,6 +42,7 @@ from src.utils.text_tools import remove_nikud, advanced_cleanup
 from src.ui.dialogs.split_dialog import SplitExportDialog
 from src.ui.tabs.karaoke_tab import KaraokeTab
 from src.ui.widgets.pdf_viewer import PDFViewerWidget
+from src.utils.settings_manager import SettingsManager
 
 class ProcessingWorker(QObject):
     finished = pyqtSignal()
@@ -1795,6 +1796,26 @@ class HebrewTTSStudio(QMainWindow):
             # קריאה לפונקציית העיבוד עם הנתונים מהדיאלוג
             self.start_split_export_process(data)
 
+    def load_initial_values_to_ui(self):
+        """מעדכנת את שדות הממשק בערכים שנטענו מההגדרות"""
+        try:
+            # עדכון שדות טלגרם
+            self.input_tg_token.setText(self.settings.get("tg_token", ""))
+            self.input_tg_chat_id.setText(self.settings.get("tg_chat_id", ""))
+            
+            # עדכון ערכי ה-SpinBoxes (השהיות)
+            self.spin_lang.setValue(self.settings.get("pause_lang", 1000))
+            self.spin_comma.setValue(self.settings.get("pause_comma", 400))
+            self.spin_sentence.setValue(self.settings.get("pause_sentence", 600))
+            
+            # עדכון כמות תהליכים מקבילים
+            if hasattr(self, 'spin_concurrent'):
+                self.spin_concurrent.setValue(self.settings.get("max_concurrent", 15))
+                
+            print("[DEBUG] UI initial values loaded from settings")
+        except Exception as e:
+            print(f"[DEBUG] Note: Some UI elements were not ready during initial load: {e}")
+    
     def start_split_export_process(self, data):
         """מתחיל תהליך של פיצול הטקסט וייצוא סדרתי (מקבל נתונים מהדיאלוג)"""
         full_text = self.editor.toPlainText()
@@ -2963,20 +2984,35 @@ class HebrewTTSStudio(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # 1. הגדרות חלון בסיסיות
         self.setWindowTitle("Hebrew PDF Studio - Ultimate Edition")
         self.setGeometry(100, 100, 1300, 950)
-        self.settings = self.load_settings()
+        
+        # 2. אתחול מנהל ההגדרות (העברת הנתיב מה-config)
+        # בהנחה ש-CONFIG_FILE מוגדר אצלך כקבוע
+        self.settings_manager = SettingsManager(CONFIG_FILE)
+        
+        # 3. טעינת ההגדרות לתוך self.settings (שימוש ב-Manager במקום בפונקציה הפנימית)
+        self.settings = self.settings_manager.load_settings(DEFAULT_SETTINGS)
 
-        self.he_voices = {"Hila (אישה - עברית)": "he-IL-HilaNeural", "Avri (גבר - עברית)": "he-IL-AvriNeural"}
+        # 4. נתונים ומשתנים
+        self.he_voices = {
+            "Hila (אישה - עברית)": "he-IL-HilaNeural", 
+            "Avri (גבר - עברית)": "he-IL-AvriNeural"
+        }
         self.en_voices = {
             "Aria (אישה - ארה\"ב)": "en-US-AriaNeural", 
             "Guy (גבר - ארה\"ב)": "en-US-GuyNeural",
             "Brian (גבר - בריטי)": "en-GB-BrianNeural"
         }
         self.file_path = ""
+        
+        # 5. בניית הממשק והעיצוב
         self.init_ui()
         self.apply_styles()
-
+        
+        # בונוס: עדכון שדות ה-UI בערכים שנטענו
+        self.load_initial_values_to_ui()
 
     def search_text(self):
         """פונקציית חיפוש מילים בתוך האדיטור"""
@@ -3056,36 +3092,26 @@ class HebrewTTSStudio(QMainWindow):
         return True
 
     def save_settings(self):
-        """
-        שמירה בטוחה: שומרת את self.settings ישירות לקובץ.
-        לא קוראת מהטבלה כדי למנוע מחיקת נתונים!
-        """
         print("\n[DEBUG] >>> save_settings() CALLED")
-        global TG_TOKEN, TG_CHAT_ID
-        try:
-            # עדכון משתנים כלליים (לא קשור למילון)
-            self.settings["tg_token"] = self.input_tg_token.text().strip()
-            self.settings["tg_chat_id"] = self.input_tg_chat_id.text().strip()
-            self.settings["pause_lang"] = self.spin_lang.value()
-            self.settings["pause_comma"] = self.spin_comma.value()
-            self.settings["pause_sentence"] = self.spin_sentence.value()
-            self.settings["max_concurrent"] = self.spin_concurrent.value()
+        
+        # 1. איסוף נתונים מהממשק לתוך המילון
+        self.settings["tg_token"] = self.input_tg_token.text().strip()
+        self.settings["tg_chat_id"] = self.input_tg_chat_id.text().strip()
+        self.settings["pause_lang"] = self.spin_lang.value()
+        self.settings["pause_comma"] = self.spin_comma.value()
+        self.settings["pause_sentence"] = self.spin_sentence.value()
+        self.settings["max_concurrent"] = self.spin_concurrent.value()
 
-            # בדיקת גודל המילון לפני השמירה
-            dict_size = len(self.settings.get("nikud_dictionary", {}))
-            print(f"[DEBUG] Saving dictionary with {dict_size} entries to disk...")
-
-            # שמירה פיזית
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=4, ensure_ascii=False)
-            
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.lbl_status.setText(f"✅ נשמר בהצלחה! ({timestamp})")
-            print(f"[DEBUG] >>> Settings saved successfully to {CONFIG_FILE}")
-            
-        except Exception as e:
-            print(f"[ERROR SAVE] {e}")
-            self.lbl_status.setText(f"❌ שגיאה בשמירה: {str(e)}")
+        # 2. שליחה ל-Manager לביצוע השמירה הפיזית
+        success, info = self.settings_manager.save_to_disk(self.settings)
+        
+        # 3. עדכון סטטוס ב-UI
+        if success:
+            self.lbl_status.setText(f"✅ נשמר בהצלחה! ({info})")
+            print(f"[DEBUG] Saving dictionary with {len(self.settings.get('nikud_dictionary', {}))} entries...")
+        else:
+            self.lbl_status.setText(f"❌ שגיאה בשמירה: {info}")
+            print(f"[ERROR SAVE] {info}")
 
 
     def add_or_update_word(self, base_word, vocalized_word, match_type="partial", update_table_ui=True):
