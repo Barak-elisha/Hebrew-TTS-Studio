@@ -404,3 +404,87 @@ class AnalysisDialog(QDialog):
         if self.parent_window:
             self.parent_window.lbl_status.setText("הטקסט עודכן (לפי השינויים בטבלה בלבד).")
         self.accept()
+
+
+class CompareDialog(QDialog):
+    def __init__(self, base_word, old_val, new_val, voice, speed, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("בדיקת מילה והשוואת אודיו")
+        self.resize(600, 400)
+        self.player = QMediaPlayer()
+        self.player.error.connect(lambda: print(f"Player Error: {self.player.errorString()}"))
+        
+        self.setLayoutDirection(Qt.RightToLeft)
+        
+        # נתונים לשמירה
+        self.voice = voice
+        self.speed = speed
+        self.result_action = "CANCEL" # ברירת מחדל
+
+        layout = QVBoxLayout(self)
+        
+        # כותרת
+        msg = f"המילה '<b>{base_word}</b>' כבר קיימת במילון (או דורשת אישור)."
+        if old_val:
+            msg += f"<br>ערך נוכחי: {old_val}"
+        
+        lbl_info = QLabel(msg)
+        lbl_info.setStyleSheet("font-size: 16px; margin-bottom: 10px;")
+        layout.addWidget(lbl_info)
+
+        # טבלת השוואה
+        table = QTableWidget(2, 3)
+        table.setHorizontalHeaderLabels(["תיאור", "טקסט", "בדיקת שמיעה"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        
+        # שורה 1: איך זה נשמע בלי ניקוד (המנוע מחליט לבד)
+        table.setItem(0, 0, QTableWidgetItem("ללא ניקוד (מקור)"))
+        table.setItem(0, 1, QTableWidgetItem(base_word))
+        btn_raw = QPushButton("🔊 נגן בלי ניקוד")
+        btn_raw.clicked.connect(lambda: self.play_preview(base_word))
+        table.setCellWidget(0, 2, btn_raw)
+
+        # שורה 2: איך זה נשמע עם הניקוד החדש
+        table.setItem(1, 0, QTableWidgetItem("הצעה חדשה (עם ניקוד)"))
+        table.setItem(1, 1, QTableWidgetItem(new_val))
+        btn_new = QPushButton("🔊 נגן עם ניקוד")
+        btn_new.setStyleSheet("background-color: #27AE60; color: white; font-weight: bold;")
+        btn_new.clicked.connect(lambda: self.play_preview(new_val))
+        table.setCellWidget(1, 2, btn_new)
+
+        layout.addWidget(table)
+        
+        # סטטוס
+        self.lbl_status = QLabel("לחץ על כפתורי הנגינה כדי לבדוק")
+        self.lbl_status.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.lbl_status)
+
+        # כפתורי פעולה
+        btn_layout = QHBoxLayout()
+        
+        btn_update = QPushButton("✅ החלף לערך החדש")
+        btn_update.setStyleSheet("background-color: #27AE60; color: white; padding: 8px;")
+        btn_update.clicked.connect(self.approve_new)
+        
+        btn_keep = QPushButton("✋ השאר את הישן / בטל")
+        btn_keep.clicked.connect(self.reject) # סוגר ב-Reject
+
+        btn_layout.addWidget(btn_update)
+        btn_layout.addWidget(btn_keep)
+        layout.addLayout(btn_layout)
+
+    def play_preview(self, text):
+        self.lbl_status.setText("מייצר אודיו... אנא המתן")
+        # יצירת worker זמני להשמעה
+        self.worker = AudioPreviewWorker(text, self.voice, self.speed)
+        self.worker.finished_url.connect(self.on_audio_ready)
+        self.worker.start()
+
+    def on_audio_ready(self, url):
+        self.lbl_status.setText("מנגן...")
+        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(url)))
+        self.player.play()
+
+    def approve_new(self):
+        self.accept() # סוגר ב-Accept

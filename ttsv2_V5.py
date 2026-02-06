@@ -51,28 +51,14 @@ from src.ui.widgets.nikud_table import PasteableTableWidget
 from src.ui.widgets.errors_table import ErrorsTableWidget
 from src.ui.widgets.jump_slider import JumpSlider
 from src.ui.dialogs.advanced_import import ProgressFileReader, AdvancedImportDialog
-
-
-class ProcessingWorker(QObject):
-    finished = pyqtSignal()
-    progress = pyqtSignal(str)  # חיווי טקסטואלי
-    percent = pyqtSignal(int)   # חיווי למד התקדמות
-
-    def process_files(self, files):
-        for i, file in enumerate(files):
-            # כאן נכנס הלוגיקה של ה-Trim וה-Decode
-            msg = f"Processing sentence {i}..."
-            self.progress.emit(msg) # שולח עדכון לממשק מבלי לעצור
-            
-            # ביצוע העיבוד בפועל...
-            
-            self.percent.emit(int((i+1)/len(files)*100))
-        self.finished.emit()
+from src.ui.widgets.nikud_keyboard import NikudKeyboard
+from src.ui.dialogs.compare_dialog import CompareDialog
+from src.workers.processing_worker import ProcessingWorker
+from src.ui.styles import MAIN_STYLE
 
 # --- קובץ הגדרות ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-
 
 # --- ברירת מחדל ---
 DEFAULT_SETTINGS = {
@@ -84,153 +70,6 @@ DEFAULT_SETTINGS = {
     "custom_symbols": {"***": 1000},
     "nikud_dictionary": {}
 }
-
-
-    
-
-
-
-
-
-
-
-# --- דיאלוג השוואה והשמעה ---
-class CompareDialog(QDialog):
-    def __init__(self, base_word, old_val, new_val, voice, speed, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("בדיקת מילה והשוואת אודיו")
-        self.resize(600, 400)
-        self.player = QMediaPlayer()
-        self.player.error.connect(lambda: print(f"Player Error: {self.player.errorString()}"))
-        
-        self.setLayoutDirection(Qt.RightToLeft)
-        
-        # נתונים לשמירה
-        self.voice = voice
-        self.speed = speed
-        self.result_action = "CANCEL" # ברירת מחדל
-
-        layout = QVBoxLayout(self)
-        
-        # כותרת
-        msg = f"המילה '<b>{base_word}</b>' כבר קיימת במילון (או דורשת אישור)."
-        if old_val:
-            msg += f"<br>ערך נוכחי: {old_val}"
-        
-        lbl_info = QLabel(msg)
-        lbl_info.setStyleSheet("font-size: 16px; margin-bottom: 10px;")
-        layout.addWidget(lbl_info)
-
-        # טבלת השוואה
-        table = QTableWidget(2, 3)
-        table.setHorizontalHeaderLabels(["תיאור", "טקסט", "בדיקת שמיעה"])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        table.verticalHeader().setVisible(False)
-        
-        # שורה 1: איך זה נשמע בלי ניקוד (המנוע מחליט לבד)
-        table.setItem(0, 0, QTableWidgetItem("ללא ניקוד (מקור)"))
-        table.setItem(0, 1, QTableWidgetItem(base_word))
-        btn_raw = QPushButton("🔊 נגן בלי ניקוד")
-        btn_raw.clicked.connect(lambda: self.play_preview(base_word))
-        table.setCellWidget(0, 2, btn_raw)
-
-        # שורה 2: איך זה נשמע עם הניקוד החדש
-        table.setItem(1, 0, QTableWidgetItem("הצעה חדשה (עם ניקוד)"))
-        table.setItem(1, 1, QTableWidgetItem(new_val))
-        btn_new = QPushButton("🔊 נגן עם ניקוד")
-        btn_new.setStyleSheet("background-color: #27AE60; color: white; font-weight: bold;")
-        btn_new.clicked.connect(lambda: self.play_preview(new_val))
-        table.setCellWidget(1, 2, btn_new)
-
-        layout.addWidget(table)
-        
-        # סטטוס
-        self.lbl_status = QLabel("לחץ על כפתורי הנגינה כדי לבדוק")
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.lbl_status)
-
-        # כפתורי פעולה
-        btn_layout = QHBoxLayout()
-        
-        btn_update = QPushButton("✅ החלף לערך החדש")
-        btn_update.setStyleSheet("background-color: #27AE60; color: white; padding: 8px;")
-        btn_update.clicked.connect(self.approve_new)
-        
-        btn_keep = QPushButton("✋ השאר את הישן / בטל")
-        btn_keep.clicked.connect(self.reject) # סוגר ב-Reject
-
-        btn_layout.addWidget(btn_update)
-        btn_layout.addWidget(btn_keep)
-        layout.addLayout(btn_layout)
-
-    def play_preview(self, text):
-        self.lbl_status.setText("מייצר אודיו... אנא המתן")
-        # יצירת worker זמני להשמעה
-        self.worker = AudioPreviewWorker(text, self.voice, self.speed)
-        self.worker.finished_url.connect(self.on_audio_ready)
-        self.worker.start()
-
-    def on_audio_ready(self, url):
-        self.lbl_status.setText("מנגן...")
-        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(url)))
-        self.player.play()
-
-    def approve_new(self):
-        self.accept() # סוגר ב-Accept
-
-class NikudKeyboard(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("מקלדת ניקוד")
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.resize(500, 350)  # הגדלתי את החלון
-        self.setLayoutDirection(Qt.RightToLeft)
-        
-        layout = QGridLayout(self)
-        
-        # הוספתי את '◌' לתצוגה בלבד, כדי שיראו את הניקוד ברור
-        # הרשימה מכילה: (תו להוספה, שם, תו לתצוגה)
-        self.chars = [
-            ('ְ', 'שְווא', '◌ְ'), ('ֱ', 'חטף סגול', '◌ֱ'), ('ֲ', 'חטף פתח', '◌ֲ'), ('ֳ', 'חטף קמץ', '◌ֳ'),
-            ('ִ', 'חיריק', '◌ִ'), ('ֵ', 'צירה', '◌ֵ'), ('ֶ', 'סגול', '◌ֶ'), ('ַ', 'פתח', '◌ַ'),
-            ('ָ', 'קמץ', '◌ָ'), ('ֹ', 'חולם', '◌ֹ'), ('ֻ', 'קובוץ', '◌ֻ'), ('ּ', 'דגש', '◌ּ'),
-            ('ׁ', 'שין ימנית', 'שׁ'), ('ׂ', 'שין שמאלית', 'שׂ'), ('ֿ', 'רפה', 'בֿ'), ('\u05bd', 'מתג (הטעמה)', '◌ֽ')
-        ]
-        
-        row, col = 0, 0
-        for char, name, display in self.chars:
-            # שימוש ב-HTML כדי להגדיל את הסימן ולהקטין את השם
-            btn_text = f"<span style='font-size: 28pt;'>{display}</span><br><span style='font-size: 10pt; color: #BDC3C7;'>{name}</span>"
-            btn = QPushButton()
-            btn.setText(name) # Fallback
-            # כאן אנחנו מגדירים את הטקסט העשיר
-            lbl = QLabel(btn_text)
-            lbl.setAlignment(Qt.AlignCenter)
-            
-            # בניית כפתור שמכיל את ה-Label (טריק כדי לעקוף מגבלות עיצוב בכפתורים רגילים)
-            btn_layout = QVBoxLayout(btn)
-            btn_layout.addWidget(lbl)
-            btn_layout.setContentsMargins(0,0,0,0)
-            
-            btn.setFixedSize(90, 85) # כפתורים גדולים ונוחים
-            btn.setCursor(Qt.PointingHandCursor)
-            
-            # שליחת התו האמיתי (char) ולא התצוגה
-            btn.clicked.connect(lambda _, c=char: self.insert_char(c))
-            
-            layout.addWidget(btn, row, col)
-            
-            col += 1
-            if col > 3: # 4 כפתורים בשורה
-                col = 0
-                row += 1
-
-    def insert_char(self, char):
-        widget = QApplication.focusWidget()
-        if widget:
-            event = QKeyEvent(QEvent.KeyPress, 0, Qt.NoModifier, char)
-            QApplication.sendEvent(widget, event)
-
 
 class HebrewTTSStudio(QMainWindow):
 
@@ -1458,7 +1297,7 @@ class HebrewTTSStudio(QMainWindow):
         
         # 5. בניית הממשק והעיצוב
         self.init_ui()
-        self.apply_styles()
+        self.setStyleSheet(MAIN_STYLE)
         
         # בונוס: עדכון שדות ה-UI בערכים שנטענו
         self.load_initial_values_to_ui()
@@ -2610,78 +2449,7 @@ class HebrewTTSStudio(QMainWindow):
             QMessageBox.critical(self, "שגיאה בייבוא", f"תקלה בחילוץ: {str(e)}")
             import traceback
             traceback.print_exc()
-            
-
-    def apply_styles(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #102A43; }
-            QLabel, QCheckBox { color: #F0F4F8; font-size: 14px; font-family: Arial; }
-            
-            /* עיצוב הקבוצות החדש */
-            QGroupBox {
-                border: 1px solid #486581;
-                border-radius: 6px;
-                margin-top: 10px;
-                color: #F0F4F8;
-                font-weight: bold;
-                background-color: #1A3C59; /* רקע טיפה שונה להפרדה */
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top center;
-                padding: 0 5px;
-                color: #62B0E8; /* צבע כותרת תכלת */
-            }
-
-            QTextEdit, QTableWidget { background-color: #243B53; color: #FFFFFF; border: 2px solid #486581; border-radius: 6px; padding: 12px; font-size: 16px; }
-            QLineEdit, QComboBox, QSpinBox { background-color: #F0F4F8; padding: 6px; color: #102A43; border-radius: 4px; }
-            
-            QPushButton { background-color: #334E68; color: #FFFFFF; padding: 8px; font-weight: bold; border-radius: 5px; }
-            QPushButton:hover { background-color: #486581; }
-            
-            QPushButton#PrimaryBtn { background-color: #F76707; font-size: 18px; border: 2px solid #D9480F; }
-            QPushButton#PrimaryBtn:hover { background-color: #D9480F; }
-            
-            QPushButton#ActionBtn { background-color: #27AE60; }
-            
-            QFrame#Panel { background-color: #243B53; border-radius: 8px; border: 1px solid #334E68; }
-            
-            QProgressBar { border: 2px solid #334E68; border-radius: 5px; text-align: center; background-color: #102A43; color: white; }
-            QProgressBar::chunk { background-color: #F76707; }
-            
-            QTabWidget::pane {
-                border: 2px solid #334E68;
-                border-top: none;
-                background-color: #102A43;
-                border-radius: 0 0 8px 8px;
-            }
-            QTabBar::tab {
-                background: #1A3C59;
-                color: #9FB3C8;
-                padding: 12px 24px;
-                margin-right: 3px;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                border: 2px solid transparent;
-                border-bottom: none;
-                font-family: 'Segoe UI Emoji', 'Segoe UI', Arial;
-                font-size: 14px;
-                font-weight: bold;
-                min-width: 120px;
-            }
-            QTabBar::tab:hover {
-                background: #243B53;
-                color: #D9E2EC;
-                border-color: #486581;
-            }
-            QTabBar::tab:selected {
-                background: #102A43;
-                color: #FFFFFF;
-                border-color: #F76707;
-                border-bottom: 3px solid #F76707;
-            }
-            QHeaderView::section { background-color: #334E68; color: white; padding: 4px; }
-        """)
+        
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
