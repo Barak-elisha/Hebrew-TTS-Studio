@@ -334,3 +334,36 @@ class TTSWorker(QThread):
         # רק וודא שאתה משתמש ב-fetch_audio_internal
         # ושהחזרת ה-AudioSegment תקינה
         return await self.process_single_sentence(sentence, idx) # הפנייה זמנית, תדביק את הלוגיקה המקורית אם יש לך
+
+
+class AudioPreviewWorker(QThread):
+    # האות מחזיר כעת שני דברים: את המפתח הייחודי ואת המידע עצמו
+    finished_data = pyqtSignal(str, bytes) 
+
+    def __init__(self, cache_key, text, voice, speed):
+        super().__init__()
+        self.cache_key = cache_key
+        self.text = text
+        self.voice = voice
+        self.speed = speed
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.generate())
+        loop.close()
+
+    async def generate(self):
+        try:
+            data = b""
+            communicate = edge_tts.Communicate(self.text, self.voice, rate=self.speed)
+            
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    data += chunk["data"]
+            
+            # החזרת המפתח והמידע
+            self.finished_data.emit(self.cache_key, data)
+            
+        except Exception as e:
+            print(f"Preview Memory Error: {e}")
