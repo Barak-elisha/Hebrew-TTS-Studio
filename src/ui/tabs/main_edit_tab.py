@@ -329,28 +329,49 @@ class MainEditTab(QWidget):
             return
             
         out_dir = os.path.dirname(self.file_path) if self.file_path else os.path.expanduser("~/Documents")
-        file_name = self.input_filename.text().strip()
-        if not file_name: file_name = f"Audio_{datetime.now().strftime('%H-%M')}"
-        if not file_name.endswith(".mp3"): file_name += ".mp3"
-        save_path = os.path.join(out_dir, file_name)
+        
+        # --- בניית שם קובץ ייחודי ---
+        base_name = self.input_filename.text().strip()
+        if not base_name: base_name = "Audio"
+        
+        # הסרת סיומת אם המשתמש הקליד אותה ידנית
+        if base_name.lower().endswith(".mp3"):
+            base_name = base_name[:-4]
+            
+        # 1. הוספת טווח עמודים לשם הקובץ
+        min_p, max_p = self.extract_pages_from_text(text)
+        page_suffix = ""
+        if min_p is not None:
+            if min_p == max_p:
+                page_suffix = f"_p{min_p}"
+            else:
+                page_suffix = f"_p{min_p}-{max_p}"
+                
+        # 2. הוספת חותמת זמן (למניעת דריסה)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        final_filename = f"{base_name}{page_suffix}_{timestamp}.mp3"
+        save_path = os.path.join(out_dir, final_filename)
+        # ---------------------------
         
         self.btn_convert.setEnabled(False)
         self.btn_convert.setText("מייצא... (מעבד)")
-        self.main_window.lbl_status.setText(f"שומר ל: {file_name}")
+        self.main_window.lbl_status.setText(f"שומר ל: {final_filename}")
         
         voice_name = self.combo_he.currentText()
         voice_key = self.he_voices.get(voice_name, "he-IL-HilaNeural")
         rate = self.combo_speed.currentText()
         current_dict = self.main_window.settings.get("nikud_dictionary", {})
         
-        # === התיקון: ניקוי תגיות לפני שליחה ל-TTS ===
+        # ניקוי תגיות לפני שליחה ל-TTS
         text_for_tts = self.clean_tags_for_tts(text)
-        # ============================================
 
-        # שמירת הקול האנגלי בהגדרות כדי שה-Worker ישתמש בו
+        # שמירת הקול האנגלי בהגדרות
         self.main_window.settings["selected_en_voice"] = self.combo_en.currentText()
 
         dual_mode = self.chk_dual.isChecked()
+        
+        # יצירת ה-Worker עם הנתיב החדש והייחודי
         self.tts_worker = TTSWorker(text_for_tts, save_path, voice_key, rate, "+0%", current_dict, parent=self.main_window, dual_mode=dual_mode)
         self.tts_worker.finished_success.connect(self.on_tts_finished)
         self.tts_worker.progress_update.connect(self.main_window.progress_bar.setValue)
@@ -362,54 +383,64 @@ class MainEditTab(QWidget):
         if not is_batch:
             self.btn_convert.setEnabled(True)
             self.btn_convert.setText("🚀 צור קובץ MP3")
-        
-        # רענון רשימת הפרויקטים בצד
+
+        # === יצירת PDF חתוך לפרויקט ===
+        relevant_text = ""
+        if is_batch and hasattr(self, 'current_batch_task') and self.current_batch_task:
+            relevant_text = self.current_batch_task['text']
+        else:
+            relevant_text = self.editor.toPlainText()
+
+        pdf_output_name = mp3_path.replace(".mp3", ".pdf")
+        created_pdf = None
+        try:
+            min_page, max_page = self.extract_pages_from_text(relevant_text)
+            # חילוץ קובץ מקור PDF מתוך תגית [FILE:...]
+            source_pdf = self._extract_source_pdf(relevant_text)
+            created_pdf = self.create_sliced_pdf(pdf_output_name, min_page, max_page, source_pdf)
+        except Exception as e:
+            print(f"[PDF] Failed to create sliced PDF: {e}")
+
+        # === רישום התיקייה, רענון רשימת הפרויקטים וטעינה לנגן ===
+        json_path = mp3_path.replace(".mp3", ".json")
         if hasattr(self.main_window, 'tab_karaoke'):
             try:
+                # רישום התיקייה שבה נשמר הקובץ כדי שתופיע ברשימת הפרויקטים
+                mp3_dir = os.path.dirname(mp3_path)
+                self.main_window.tab_karaoke.track_directory(mp3_dir)
                 self.main_window.tab_karaoke.refresh_file_list()
             except Exception as e:
                 print(f"[ERROR] Failed to refresh sidebar: {e}")
 
-        # טעינת הפרויקט לנגן (אם זה לא Batch)
-        json_path = mp3_path.replace(".mp3", ".json")
-        if os.path.exists(json_path) and hasattr(self.main_window, 'tab_karaoke'):
-            self.main_window.tab_karaoke.load_project(json_path, mp3_path)
-            if not is_batch:
-                self.main_window.tabs.setCurrentWidget(self.main_window.tab_karaoke)
-        
-        # === החלק החדש: שליחה לטלגרם עם PDF ===
+            if os.path.exists(json_path):
+                self.main_window.tab_karaoke.load_project(json_path, mp3_path)
+                if not is_batch:
+                    self.main_window.tabs.setCurrentWidget(self.main_window.tab_karaoke)
+
+        # === שליחה לטלגרם עם PDF ===
         token = self.main_window.settings.get("tg_token", "")
         chat_id = self.main_window.settings.get("tg_chat_id", "")
-        
+
         if token and chat_id:
             files_to_send = [(mp3_path, 'audio')]
-            
-            # ניסיון ליצור ולצרף את ה-PDF הרלוונטי
-            try:
-                # 1. זיהוי הטקסט הרלוונטי (האם זה פיצול או מלא?)
-                relevant_text = ""
-                if is_batch and hasattr(self, 'current_batch_task') and self.current_batch_task:
-                    relevant_text = self.current_batch_task['text']
-                else:
-                    relevant_text = self.editor.toPlainText()
-                
-                # 2. חילוץ טווח העמודים מתוך הטקסט
-                min_page, max_page = self.extract_pages_from_text(relevant_text)
-                
-                # 3. יצירת קובץ PDF זמני
-                pdf_output_name = mp3_path.replace(".mp3", ".pdf")
-                created_pdf = self.create_sliced_pdf(pdf_output_name, min_page, max_page)
-                
-                if created_pdf and os.path.exists(created_pdf):
-                    files_to_send.append((created_pdf, 'document'))
-                    
-            except Exception as e:
-                print(f"[TG-PDF] Failed to attach PDF: {e}")
+            if created_pdf and os.path.exists(created_pdf):
+                files_to_send.append((created_pdf, 'document'))
 
-            # שליחה
             self.tg_worker = TelegramWorker(token, chat_id, files_to_send)
             self.tg_worker.finished.connect(self.on_telegram_upload_complete)
             self.tg_worker.start()
+
+    def _extract_source_pdf(self, text):
+        """מחלץ את נתיב ה-PDF המקורי מתוך תגית [FILE:...] בטקסט"""
+        file_matches = re.findall(r'\[FILE:(.*?)\]', text)
+        if file_matches:
+            # לוקחים את הראשון (או האחרון, תלוי בהקשר)
+            raw_path = file_matches[0]
+            clean_path = raw_path.replace('\u200e', '').replace('\u200f', '').replace('\u202a', '').replace('\u202c', '').strip()
+            clean_path = clean_path.replace('. pdf', '.pdf')
+            if os.path.exists(clean_path):
+                return clean_path
+        return None
 
     def on_tts_error(self, msg):
         self.btn_convert.setEnabled(True)
@@ -887,12 +918,13 @@ class MainEditTab(QWidget):
             self.btn_convert.setEnabled(True)
             self.btn_split_export.setEnabled(True)
             self.main_window.progress_bar.setValue(100)
-            
-            # === רענון רשימת הפרויקטים בצד ===
+
+            # === רענון רשימת הפרויקטים ומעבר לטאב הנגן ===
             if hasattr(self.main_window, 'tab_karaoke'):
                 try:
                     self.main_window.tab_karaoke.refresh_file_list()
-                    print("[DEBUG] Project list refreshed successfully.")
+                    self.main_window.tabs.setCurrentWidget(self.main_window.tab_karaoke)
+                    print("[DEBUG] Project list refreshed and switched to karaoke tab.")
                 except Exception as e:
                     print(f"[ERROR] Failed to refresh project list: {e}")
             # ==================================
@@ -940,13 +972,19 @@ class MainEditTab(QWidget):
             return min(pages), max(pages)
         return None, None
          
-    def create_sliced_pdf(self, output_filename, start_page=None, end_page=None):
+    def create_sliced_pdf(self, output_filename, start_page=None, end_page=None, source_pdf=None):
         """
         יוצר קובץ PDF הכולל רק את העמודים הרלוונטיים.
+        source_pdf - נתיב ל-PDF מקור (אם None, משתמש ב-self.file_path).
         אם start_page/end_page לא מסופקים, משתמש בערכים מה-GUI.
         """
-        if not hasattr(self, 'file_path') or not self.file_path or not os.path.exists(self.file_path):
-            return None
+        # קביעת קובץ מקור
+        pdf_source = source_pdf if source_pdf and os.path.exists(source_pdf) else None
+        if not pdf_source:
+            if hasattr(self, 'file_path') and self.file_path and os.path.exists(self.file_path):
+                pdf_source = self.file_path
+            else:
+                return None
 
         try:
             # קביעת טווח העמודים (אם לא סופק, לוקחים מהממשק)
@@ -954,17 +992,17 @@ class MainEditTab(QWidget):
                 try:
                     start_page = int(self.input_start.text())
                 except: start_page = 1
-            
+
             if end_page is None:
                 try:
                     end_page = int(self.input_end.text())
                 except: end_page = 1000
 
-            reader = PyPDF2.PdfReader(self.file_path)
+            reader = PyPDF2.PdfReader(pdf_source)
             writer = PyPDF2.PdfWriter()
-            
+
             total_pages = len(reader.pages)
-            
+
             # התאמה לאינדקס 0-based
             start_idx = max(0, start_page - 1)
             end_idx = min(total_pages, end_page)
@@ -977,7 +1015,8 @@ class MainEditTab(QWidget):
 
             with open(output_filename, "wb") as f:
                 writer.write(f)
-            
+
+            print(f"[PDF] Created sliced PDF: {output_filename} (pages {start_page}-{end_page} from {os.path.basename(pdf_source)})")
             return output_filename
 
         except Exception as e:

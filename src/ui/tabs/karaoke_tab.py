@@ -1,12 +1,12 @@
 import os
 import json
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QFileDialog, 
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QFileDialog, QComboBox,
                              QMessageBox, QFrame, QSplitter, QTreeWidget, QTreeWidgetItem)
 from PyQt5.QtCore import Qt, QUrl
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QTextBlockFormat, QColor
-from PyQt5.QtWidgets import (QMenu, QTextEdit, QDialog, QSlider)
+from PyQt5.QtWidgets import (QMenu, QTextEdit, QDialog, QSlider, QInputDialog, QAction)
 from PyQt5.QtCore import QEvent
 import unicodedata
 from datetime import datetime
@@ -47,8 +47,23 @@ class KaraokeTab(QWidget):
         self.current_json_data = []
         self.sentence_ranges = []
         self.current_file_id = None
-        self.current_pdf_path = None 
+        self.current_pdf_path = None
         self.marked_errors = set() # למעקב אחרי מילים שסומנו באדום
+
+        # מעקב אחרי תיקיות שבהן יש פרויקטים
+        self.tracked_dirs = set()
+        self.tracked_dirs.add(self.output_dir)
+        # טעינת תיקיות שמורות
+        if self.main_window and hasattr(self.main_window, 'settings'):
+            saved_dirs = self.main_window.settings.get("tracked_project_dirs", [])
+            for d in saved_dirs:
+                if os.path.exists(d):
+                    self.tracked_dirs.add(d)
+            # טעינת מבנה תיקיות וירטואלי
+            self.virtual_folders = self.main_window.settings.get("virtual_folders", {})
+        else:
+            self.virtual_folders = {}
+        # virtual_folders = { "שם תיקייה": ["path/to/file.json", ...], ... }
         
         # הגדרות עיצוב ברירת מחדל
         self.styles = {
@@ -94,20 +109,41 @@ class KaraokeTab(QWidget):
         
         self.list_files = QTreeWidget()
         self.list_files.setHeaderHidden(True)
+        self.list_files.setSelectionMode(QTreeWidget.ExtendedSelection)
         self.list_files.itemClicked.connect(self.on_file_selected)
+        self.list_files.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_files.customContextMenuRequested.connect(self.show_file_context_menu)
         # עיצוב העץ
         self.list_files.setStyleSheet("""
             QTreeWidget { background-color: #243B53; color: white; border: 1px solid #486581; border-radius: 4px; }
             QTreeWidget::item:selected { background-color: #F76707; }
         """)
-        
+
         files_layout.addWidget(QLabel("📂 פרויקטים:"))
-        # --- הנה הכפתור שהיה חסר ---
-        btn_import = QPushButton("📥 ייבא פרויקט")
-        btn_import.setStyleSheet("background-color: #2980B9; color: white; padding: 6px; font-weight: bold; border-radius: 4px;")
+
+        # כפתורי ניהול
+        mgmt_row = QHBoxLayout()
+        btn_import = QPushButton("📥 ייבא")
+        btn_import.setStyleSheet("background-color: #2980B9; color: white; padding: 4px; font-weight: bold; border-radius: 4px;")
         btn_import.clicked.connect(self.import_external_project)
-        files_layout.addWidget(btn_import)
-        # ---------------------------
+        mgmt_row.addWidget(btn_import)
+
+        btn_new_folder = QPushButton("📁 תיקייה")
+        btn_new_folder.setStyleSheet("background-color: #8E44AD; color: white; padding: 4px; font-weight: bold; border-radius: 4px;")
+        btn_new_folder.clicked.connect(self.create_virtual_folder)
+        mgmt_row.addWidget(btn_new_folder)
+        files_layout.addLayout(mgmt_row)
+
+        # סרגל סינון תאריך
+        filter_row = QHBoxLayout()
+        self.combo_date_filter = QComboBox()
+        self.combo_date_filter.addItems(["הכל", "היום", "השבוע", "החודש", "השנה"])
+        self.combo_date_filter.setStyleSheet("background-color: #102A43; color: white; padding: 2px; border: 1px solid #486581;")
+        self.combo_date_filter.currentIndexChanged.connect(lambda: self.refresh_file_list())
+        filter_row.addWidget(QLabel("🔍"))
+        filter_row.addWidget(self.combo_date_filter)
+        files_layout.addLayout(filter_row)
+
         files_layout.addWidget(self.list_files)
         
         self.main_horizontal_splitter.addWidget(self.files_container)
@@ -253,54 +289,7 @@ class KaraokeTab(QWidget):
         self.player.setPlaybackRate(speed_val)
         self.lbl_speed_display.setText(f"{speed_val:.1f}x")
 
-    def on_file_selected(self, item, column=0):
-        # הגנה: אם לחצו על כותרת קבוצה
-        if item.childCount() > 0 or not item.parent():
-            item.setExpanded(not item.isExpanded())
-            return
-
-        json_path = item.data(0, Qt.UserRole)
-        if not json_path: return 
-
-        self.save_progress()
-        self.marked_errors.clear()
-        
-        # שימוש ב-splitext כדי להחליף סיומת בצורה בטוחה יותר
-        base_path = os.path.splitext(json_path)[0]
-        mp3_path = base_path + ".mp3"
-        pdf_path = base_path + ".pdf"
-        
-        print(f"\n[DEBUG] Selected Project: {os.path.basename(json_path)}")
-        print(f"[DEBUG] Looking for PDF at: {pdf_path}")
-
-        self.current_file_id = os.path.basename(json_path)
-        
-        # טעינת נתונים
-        self.load_project(json_path, mp3_path)
-        
-        # בדיקת קיום PDF וטעינתו
-        if os.path.exists(pdf_path):
-            print("[DEBUG] ✅ Local PDF found! Loading...")
-            self.pdf_viewer.load_pdf(pdf_path)
-        else:
-            print("[DEBUG] ❌ Local PDF NOT found.")
-            # ניסיון טעינה מהזיכרון של החלון הראשי (Fallback)
-            if self.main_window and hasattr(self.main_window, 'file_path') and self.main_window.file_path:
-                print(f"[DEBUG] Loading original source PDF: {self.main_window.file_path}")
-                self.pdf_viewer.load_pdf(self.main_window.file_path)
-            else:
-                # איפוס ה-Viewer אם אין שום PDF
-                self.pdf_viewer.image_label.setText("לא נמצא קובץ PDF לפרויקט זה")
-
-    def toggle_sidebar(self):
-        # בדיקה אם הרשימה כרגע גלויה (גודל גדול מ-0)
-        sizes = self.main_horizontal_splitter.sizes()
-        if sizes[0] > 0:
-            self.main_horizontal_splitter.setSizes([0, 1000]) # קיפול
-        else:
-            self.main_horizontal_splitter.setSizes([250, 1000]) # הרחבה
-
-    # === טיפול באירועי עכבר (החלק שהיה חסר) ===
+    # === טיפול באירועי עכבר ===
     
     def eventFilter(self, source, event):
         if source is self.text_display.viewport():
@@ -377,146 +366,199 @@ class KaraokeTab(QWidget):
     # === ייבוא פרויקטים (החלק שהיה חסר) ===
 
     def import_external_project(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "בחר קובץ MP3 או JSON", "", "Project Files (*.json *.mp3)")
-        if not file_path: return
-        
-        filename = os.path.basename(file_path)
-        # חילוץ השם ללא סיומת
-        base_name = os.path.splitext(filename)[0]
-        dir_name = os.path.dirname(file_path)
-        
-        # בניית נתיבים למקור
-        source_mp3 = os.path.join(dir_name, base_name + ".mp3")
-        source_json = os.path.join(dir_name, base_name + ".json")
-        source_pdf = os.path.join(dir_name, base_name + ".pdf") # <--- הוספנו חיפוש PDF
-        
-        # בניית נתיבים ליעד
-        target_mp3 = os.path.join(self.output_dir, base_name + ".mp3")
-        target_json = os.path.join(self.output_dir, base_name + ".json")
-        target_pdf = os.path.join(self.output_dir, base_name + ".pdf")
-
-        # בדיקה שקבצי החובה קיימים
-        if not os.path.exists(source_mp3) or not os.path.exists(source_json):
-            QMessageBox.warning(self, "חסר קובץ", "כדי לייבא פרויקט, חובה שיהיו קבצי MP3 ו-JSON באותה תיקייה עם אותו שם.")
+        """ייבוא פרויקטים - תומך בבחירת מספר קבצים"""
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "בחר קבצי MP3 או JSON", "", "Project Files (*.json *.mp3)")
+        if not file_paths:
             return
 
-        try:
-            import shutil
-            # העתקת קבצי חובה
-            if os.path.abspath(source_mp3) != os.path.abspath(target_mp3):
-                shutil.copy2(source_mp3, target_mp3)
-            if os.path.abspath(source_json) != os.path.abspath(target_json):
-                shutil.copy2(source_json, target_json)
-            
-            # העתקת PDF (אופציונלי - רק אם קיים במקור)
-            if os.path.exists(source_pdf):
-                if os.path.abspath(source_pdf) != os.path.abspath(target_pdf):
-                    shutil.copy2(source_pdf, target_pdf)
-                    print(f"[DEBUG] Imported PDF successfully: {target_pdf}")
-            
-            self.refresh_file_list()
-            self.select_file_by_path(target_json)
-            QMessageBox.information(self, "הצלחה", "הפרויקט (כולל PDF אם היה) יובא בהצלחה!")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "שגיאה", f"תקלה בייבוא: {e}")
+        imported = 0
+        skipped = 0
+        for file_path in file_paths:
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            dir_name = os.path.dirname(file_path)
+
+            source_mp3 = os.path.join(dir_name, base_name + ".mp3")
+            source_json = os.path.join(dir_name, base_name + ".json")
+
+            if not os.path.exists(source_mp3) or not os.path.exists(source_json):
+                skipped += 1
+                continue
+
+            # במקום להעתיק - פשוט עוקבים אחרי התיקייה
+            self.track_directory(dir_name)
+            imported += 1
+
+        self.refresh_file_list()
+
+        if imported > 0:
+            # בחירת הפרויקט הראשון שיובא
+            first_base = os.path.splitext(os.path.basename(file_paths[0]))[0]
+            first_dir = os.path.dirname(file_paths[0])
+            first_json = os.path.join(first_dir, first_base + ".json")
+            if os.path.exists(first_json):
+                self.select_file_by_path(first_json)
+
+        msg = f"יובאו {imported} פרויקטים."
+        if skipped > 0:
+            msg += f"\n{skipped} קבצים דולגו (חסר MP3 או JSON)."
+        QMessageBox.information(self, "ייבוא", msg)
 
     # === ניהול קבצים סטנדרטי ===
 
+    def _save_tracked_dirs(self):
+        """שומר את רשימת התיקיות המנוטרות להגדרות"""
+        if self.main_window and hasattr(self.main_window, 'settings'):
+            self.main_window.settings["tracked_project_dirs"] = list(self.tracked_dirs)
+            self.main_window.save_settings()
+
+    def _save_virtual_folders(self):
+        """שומר את מבנה התיקיות הוירטואליות להגדרות"""
+        if self.main_window and hasattr(self.main_window, 'settings'):
+            self.main_window.settings["virtual_folders"] = self.virtual_folders
+            self.main_window.save_settings()
+
+    def track_directory(self, dir_path):
+        """מוסיף תיקייה למעקב (כדי שפרויקטים שלה יופיעו ברשימה)"""
+        if dir_path and os.path.isdir(dir_path):
+            self.tracked_dirs.add(dir_path)
+            self._save_tracked_dirs()
+
+    def _collect_all_projects(self):
+        """איסוף כל הפרויקטים מכל התיקיות המנוטרות"""
+        files = []
+        seen_paths = set()
+        for directory in list(self.tracked_dirs):
+            if not os.path.exists(directory):
+                continue
+            for f in os.listdir(directory):
+                if f.endswith(".json"):
+                    full_path = os.path.join(directory, f)
+                    norm_path = os.path.normpath(full_path)
+                    if norm_path in seen_paths:
+                        continue
+                    seen_paths.add(norm_path)
+                    if os.path.exists(full_path.replace(".json", ".mp3")):
+                        mod_time = os.path.getmtime(full_path)
+                        files.append((f, full_path, mod_time))
+        files.sort(key=lambda x: x[2], reverse=True)
+        return files
+
+    def _passes_date_filter(self, mod_time):
+        """בודק אם קובץ עובר את סינון התאריך הנבחר"""
+        if not hasattr(self, 'combo_date_filter'):
+            return True
+        filter_idx = self.combo_date_filter.currentIndex()
+        if filter_idx == 0:  # הכל
+            return True
+        now = datetime.now()
+        diff_days = (now - datetime.fromtimestamp(mod_time)).days
+        if filter_idx == 1:  # היום
+            today_start = datetime(now.year, now.month, now.day).timestamp()
+            return mod_time >= today_start
+        elif filter_idx == 2:  # השבוע
+            return diff_days < 7
+        elif filter_idx == 3:  # החודש
+            return diff_days < 30
+        elif filter_idx == 4:  # השנה
+            return diff_days < 365
+        return True
+
     def refresh_file_list(self):
         self.list_files.clear()
-        if not os.path.exists(self.output_dir): return
-        
-        # 1. איסוף כל הקבצים ומיון לפי תאריך (הכי חדש למעלה)
-        files = []
-        for f in os.listdir(self.output_dir):
-            if f.endswith(".json"):
-                full_path = os.path.join(self.output_dir, f)
-                # בודקים שיש MP3 תואם
-                if os.path.exists(full_path.replace(".json", ".mp3")):
-                    mod_time = os.path.getmtime(full_path)
-                    files.append((f, full_path, mod_time))
-        
-        # מיון: מהחדש לישן
-        files.sort(key=lambda x: x[2], reverse=True)
-        
-        # 2. יצירת קבוצות (Top Level Items)
-        groups = {
-            "today": QTreeWidgetItem(["📅 היום"]),
-            "yesterday": QTreeWidgetItem(["⏮️ אתמול"]),
-            "week": QTreeWidgetItem(["🗓️ השבוע"]),
-            "month": QTreeWidgetItem(["🗄️ החודש"]),
-            "older": QTreeWidgetItem(["⏳ ישנים יותר"])
-        }
-        
-        # הוספת הקבוצות לעץ ועיצוב
-        for key in ["today", "yesterday", "week", "month", "older"]:
-            item = groups[key]
-            # עיצוב מודגש לכותרת
-            font = item.font(0)
+
+        all_files = self._collect_all_projects()
+
+        # מיפוי קבצים שמשויכים לתיקיות וירטואליות
+        files_in_virtual = set()
+        for folder_name, file_list in self.virtual_folders.items():
+            for fp in file_list:
+                files_in_virtual.add(os.path.normpath(fp))
+
+        # יצירת תיקיות וירטואליות בעץ
+        for folder_name in sorted(self.virtual_folders.keys()):
+            folder_item = QTreeWidgetItem([f"📁 {folder_name}"])
+            folder_item.setData(0, Qt.UserRole + 1, "virtual_folder")
+            folder_item.setData(0, Qt.UserRole + 2, folder_name)
+            font = folder_item.font(0)
             font.setBold(True)
-            item.setFont(0, font)
-            item.setForeground(0, QColor("#F1C40F")) # צבע צהבהב לכותרות
-            self.list_files.addTopLevelItem(item)
-            item.setExpanded(False) # ברירת מחדל: מקופל
+            folder_item.setFont(0, font)
+            folder_item.setForeground(0, QColor("#3498DB"))
+            self.list_files.addTopLevelItem(folder_item)
+            folder_item.setExpanded(True)
 
-        # נפתח את "היום" כברירת מחדל
-        groups["today"].setExpanded(True)
+            for fpath in self.virtual_folders[folder_name]:
+                if not os.path.exists(fpath):
+                    continue
+                # סינון לפי תאריך גם בתוך תיקיות
+                try:
+                    ftime = os.path.getmtime(fpath)
+                    if not self._passes_date_filter(ftime):
+                        continue
+                except:
+                    pass
+                display_name = os.path.splitext(os.path.basename(fpath))[0]
+                file_item = QTreeWidgetItem([display_name])
+                file_item.setData(0, Qt.UserRole, fpath)
+                file_item.setToolTip(0, fpath)
+                folder_item.addChild(file_item)
 
-        # 3. מיון הקבצים לתוך הקבוצות
-        now = datetime.now()
-        today_start = datetime(now.year, now.month, now.day).timestamp()
-        
-        for fname, fpath, ftime in files:
-            # יצירת פריט קובץ
+        # קבצים שאינם בתיקיות וירטואליות - תחת "כללי"
+        unsorted_item = QTreeWidgetItem(["📋 כללי"])
+        unsorted_item.setData(0, Qt.UserRole + 1, "unsorted_group")
+        font = unsorted_item.font(0)
+        font.setBold(True)
+        unsorted_item.setFont(0, font)
+        unsorted_item.setForeground(0, QColor("#F1C40F"))
+
+        for fname, fpath, ftime in all_files:
+            norm_fpath = os.path.normpath(fpath)
+            if norm_fpath in files_in_virtual:
+                continue
+            if not self._passes_date_filter(ftime):
+                continue
+
             display_name = os.path.splitext(fname)[0]
             file_item = QTreeWidgetItem([display_name])
             file_item.setData(0, Qt.UserRole, fpath)
             file_item.setToolTip(0, fpath)
-            
-            # בדיקה לאן לשייך
-            diff_days = (now - datetime.fromtimestamp(ftime)).days
-            
-            if ftime >= today_start:
-                groups["today"].addChild(file_item)
-            elif diff_days == 1: # שימו לב: זה תלוי שעה, לדיוק מוחלט צריך השוואת תאריכים
-                groups["yesterday"].addChild(file_item)
-            elif diff_days < 7:
-                groups["week"].addChild(file_item)
-            elif diff_days < 30:
-                groups["month"].addChild(file_item)
-            else:
-                groups["older"].addChild(file_item)
+            unsorted_item.addChild(file_item)
 
-        # 4. ניקוי קבוצות ריקות (אופציונלי - כדי לא להציג כותרות סתם)
+        if unsorted_item.childCount() > 0:
+            self.list_files.addTopLevelItem(unsorted_item)
+            unsorted_item.setExpanded(True)
+
+        # ניקוי תיקיות וירטואליות ריקות (מהתצוגה, לא מההגדרות)
         root = self.list_files.invisibleRootItem()
         for i in reversed(range(root.childCount())):
             item = root.child(i)
-            if item.childCount() == 0:
-                root.removeChild(item)
+            if item.data(0, Qt.UserRole + 1) == "virtual_folder" and item.childCount() == 0:
+                # תיקייה ריקה אחרי סינון - עדיין מציגים אותה
+                pass
 
     def on_file_selected(self, item, column=0):
-        if item.childCount() > 0 or not item.parent():
+        # אם לחצו על כותרת קבוצה/תיקייה - פתח/סגור
+        if item.childCount() > 0 and not item.data(0, Qt.UserRole):
+            item.setExpanded(not item.isExpanded())
+            return
+        # בדיקה שיש נתיב קובץ
+        json_path = item.data(0, Qt.UserRole)
+        if not json_path:
             item.setExpanded(not item.isExpanded())
             return
 
-        json_path = item.data(0, Qt.UserRole)
-        if not json_path: return 
-
         self.save_progress()
         self.marked_errors.clear()
-        
+
         mp3_path = json_path.replace(".json", ".mp3")
-        pdf_path = json_path.replace(".json", ".pdf") # הנתיב החדש שבו ה-PDF מחכה
-        
+        pdf_path = json_path.replace(".json", ".pdf")
+
         self.current_file_id = os.path.basename(json_path)
         self.load_project(json_path, mp3_path)
-        
-        # טעינת ה-PDF אם הוא נמצא בתיקיית הפרויקטים
+
         if os.path.exists(pdf_path):
             self.pdf_viewer.load_pdf(pdf_path)
-        elif self.main_window and hasattr(self.main_window, 'file_path') and self.main_window.file_path:
-            self.pdf_viewer.load_pdf(self.main_window.file_path)
+        elif self.main_window and hasattr(self.main_window, 'tab_main') and self.main_window.tab_main.file_path:
+            self.pdf_viewer.load_pdf(self.main_window.tab_main.file_path)
 
     def load_project(self, json_path, mp3_path):
         try:
@@ -548,49 +590,173 @@ class KaraokeTab(QWidget):
             self.pdf_viewer.load_pdf(path)
 
     def select_file_by_path(self, path):
-        """בחירה אוטומטית בקובץ (פותח את התיקייה הרלוונטית בעץ)"""
+        """בחירה אוטומטית בקובץ (מחפש בכל רמות העץ)"""
         target = os.path.normpath(path)
-        
-        # מעבר על כל הקבוצות הראשיות
-        root = self.list_files.invisibleRootItem()
-        for i in range(root.childCount()):
-            group = root.child(i)
-            # מעבר על הילדים בקבוצה
-            for j in range(group.childCount()):
-                child = group.child(j)
+
+        def search_children(parent_item):
+            for j in range(parent_item.childCount()):
+                child = parent_item.child(j)
                 data_path = child.data(0, Qt.UserRole)
                 if data_path and os.path.normpath(data_path) == target:
-                    # מצאנו!
-                    group.setExpanded(True) # פותח את התיקייה
+                    parent_item.setExpanded(True)
                     self.list_files.setCurrentItem(child)
                     self.list_files.scrollToItem(child)
                     self.on_file_selected(child)
-                    return
+                    return True
+                # חיפוש ברמה עמוקה יותר
+                if child.childCount() > 0:
+                    if search_children(child):
+                        return True
+            return False
+
+        root = self.list_files.invisibleRootItem()
+        search_children(root)
 
     def show_file_context_menu(self, pos):
         item = self.list_files.itemAt(pos)
-        # מציגים תפריט רק אם זה קובץ (יש לו הורה) ולא כותרת
-        if not item or not item.parent(): return
-        
+        if not item:
+            return
+
         menu = QMenu()
+        item_type = item.data(0, Qt.UserRole + 1)
+        json_path = item.data(0, Qt.UserRole)
+
+        if item_type == "virtual_folder":
+            # תפריט לתיקייה וירטואלית
+            folder_name = item.data(0, Qt.UserRole + 2)
+            action_rename = menu.addAction("✏️ שנה שם תיקייה")
+            action_delete_folder = menu.addAction("🗑️ מחק תיקייה")
+
+            chosen = menu.exec_(self.list_files.mapToGlobal(pos))
+            if chosen == action_rename:
+                self._rename_virtual_folder(folder_name)
+            elif chosen == action_delete_folder:
+                self._delete_virtual_folder(folder_name)
+            return
+
+        if not json_path:
+            return
+
+        # תפריט לפרויקט (קובץ)
         action_delete = menu.addAction("🗑️ מחק פרויקט")
-        
-        if menu.exec_(self.list_files.mapToGlobal(pos)) == action_delete:
-            json_path = item.data(0, Qt.UserRole)
-            if not json_path: return
-            
-            mp3_path = json_path.replace(".json", ".mp3")
-            if QMessageBox.question(self, "מחיקה", "למחוק את הקבצים?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
-                try:
-                    if os.path.exists(json_path): os.remove(json_path)
-                    if os.path.exists(mp3_path): os.remove(mp3_path)
-                    
-                    # מחיקה מהעץ ויזואלית (כדי לא לרענן הכל)
-                    item.parent().removeChild(item)
-                    self.text_display.clear()
-                    self.player.stop()
-                except: 
-                    self.refresh_file_list() # במקרה של שגיאה מרעננים הכל
+
+        # תפריט "העבר לתיקייה"
+        move_menu = menu.addMenu("📁 העבר לתיקייה")
+        action_no_folder = move_menu.addAction("── ללא תיקייה ──")
+        move_menu.addSeparator()
+        folder_actions = {}
+        for folder_name in sorted(self.virtual_folders.keys()):
+            action = move_menu.addAction(f"📁 {folder_name}")
+            folder_actions[action] = folder_name
+        move_menu.addSeparator()
+        action_new_folder = move_menu.addAction("➕ תיקייה חדשה...")
+
+        chosen = menu.exec_(self.list_files.mapToGlobal(pos))
+
+        if chosen == action_delete:
+            self._delete_project(item, json_path)
+        elif chosen == action_no_folder:
+            self._remove_from_all_folders(json_path)
+        elif chosen == action_new_folder:
+            self._move_to_new_folder(json_path)
+        elif chosen in folder_actions:
+            self._move_to_folder(json_path, folder_actions[chosen])
+
+    def _delete_project(self, item, json_path):
+        """מחיקת פרויקט (קבצים מהדיסק + מרשימה)"""
+        if QMessageBox.question(self, "מחיקה", "למחוק את הפרויקט?",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            base = os.path.splitext(json_path)[0]
+            for ext in [".json", ".mp3", ".pdf"]:
+                fpath = base + ext
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+
+            # הסרה מתיקיות וירטואליות
+            norm = os.path.normpath(json_path)
+            for folder_name in list(self.virtual_folders.keys()):
+                paths = self.virtual_folders[folder_name]
+                self.virtual_folders[folder_name] = [p for p in paths if os.path.normpath(p) != norm]
+            self._save_virtual_folders()
+
+            # הסרה מהעץ
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            else:
+                idx = self.list_files.indexOfTopLevelItem(item)
+                if idx >= 0:
+                    self.list_files.takeTopLevelItem(idx)
+
+            self.text_display.clear()
+            self.player.stop()
+        except Exception as e:
+            print(f"[ERROR] Delete project: {e}")
+            self.refresh_file_list()
+
+    def create_virtual_folder(self):
+        """יצירת תיקייה וירטואלית חדשה"""
+        name, ok = QInputDialog.getText(self, "תיקייה חדשה", "שם התיקייה:")
+        if ok and name.strip():
+            name = name.strip()
+            if name in self.virtual_folders:
+                QMessageBox.warning(self, "קיימת", f"תיקייה בשם '{name}' כבר קיימת.")
+                return
+            self.virtual_folders[name] = []
+            self._save_virtual_folders()
+            self.refresh_file_list()
+
+    def _rename_virtual_folder(self, old_name):
+        """שינוי שם תיקייה וירטואלית"""
+        new_name, ok = QInputDialog.getText(self, "שינוי שם", "שם חדש:", text=old_name)
+        if ok and new_name.strip() and new_name.strip() != old_name:
+            new_name = new_name.strip()
+            if new_name in self.virtual_folders:
+                QMessageBox.warning(self, "קיימת", f"תיקייה בשם '{new_name}' כבר קיימת.")
+                return
+            self.virtual_folders[new_name] = self.virtual_folders.pop(old_name)
+            self._save_virtual_folders()
+            self.refresh_file_list()
+
+    def _delete_virtual_folder(self, folder_name):
+        """מחיקת תיקייה וירטואלית (הקבצים עצמם לא נמחקים)"""
+        if QMessageBox.question(self, "מחיקת תיקייה",
+                                f"למחוק את התיקייה '{folder_name}'?\n(הקבצים עצמם לא יימחקו)",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.virtual_folders.pop(folder_name, None)
+            self._save_virtual_folders()
+            self.refresh_file_list()
+
+    def _move_to_folder(self, json_path, folder_name):
+        """העברת פרויקט לתיקייה וירטואלית"""
+        norm = os.path.normpath(json_path)
+        # הסרה מכל תיקייה אחרת
+        for fn in self.virtual_folders:
+            self.virtual_folders[fn] = [p for p in self.virtual_folders[fn] if os.path.normpath(p) != norm]
+        # הוספה לתיקייה הנבחרת
+        if json_path not in self.virtual_folders[folder_name]:
+            self.virtual_folders[folder_name].append(json_path)
+        self._save_virtual_folders()
+        self.refresh_file_list()
+
+    def _remove_from_all_folders(self, json_path):
+        """הסרת פרויקט מכל התיקיות הוירטואליות"""
+        norm = os.path.normpath(json_path)
+        for fn in self.virtual_folders:
+            self.virtual_folders[fn] = [p for p in self.virtual_folders[fn] if os.path.normpath(p) != norm]
+        self._save_virtual_folders()
+        self.refresh_file_list()
+
+    def _move_to_new_folder(self, json_path):
+        """יצירת תיקייה חדשה והעברת פרויקט אליה"""
+        name, ok = QInputDialog.getText(self, "תיקייה חדשה", "שם התיקייה:")
+        if ok and name.strip():
+            name = name.strip()
+            if name not in self.virtual_folders:
+                self.virtual_folders[name] = []
+            self._move_to_folder(json_path, name)
 
     # --- טעינת טקסט וסנכרון ---
     def reload_text_content(self):

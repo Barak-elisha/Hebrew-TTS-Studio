@@ -325,35 +325,119 @@ class TTSWorker(QThread):
             return self.smart_trim(seg, idx)
         except: return AudioSegment.silent(duration=0, frame_rate=24000)
 
-    def smart_trim(self, audio_segment, idx, limit=-50):
-        # (הלוגיקה שלך ל-trim נשארת זהה)
-        return audio_segment
+    def smart_trim(self, audio_segment, idx, limit=-40):
+        """חותך שקט מתחילת וסוף קטע אודיו"""
+        from pydub.silence import detect_leading_silence
+        try:
+            start_trim = detect_leading_silence(audio_segment, silence_threshold=limit)
+            end_trim = detect_leading_silence(audio_segment.reverse(), silence_threshold=limit)
+            duration = len(audio_segment)
+            if start_trim + end_trim >= duration:
+                return audio_segment
+            return audio_segment[start_trim:duration - end_trim]
+        except Exception:
+            return audio_segment
+
+    def _merge_language_parts(self, raw_parts):
+        """
+        מאחד חלקים קטנים (סימנים, סוגריים, אותיות בודדות) עם החלק הסמוך,
+        ומאחד חלקים רצופים באותה שפה לחלק אחד.
+        מונע שבירה של נוסחאות כמו Q∗E∗C=Q(C-Cout) לחלקים זעירים.
+        """
+        # שלב 1: סינון חלקים ריקים
+        stripped = [(p, p.strip()) for p in raw_parts if p.strip()]
+        if not stripped:
+            return []
+
+        # שלב 2: איחוד סימנים בלבד עם השכנים
+        merged = []
+        for original, s in stripped:
+            has_hebrew = bool(re.search(r'[\u0590-\u05FF]', s))
+            has_latin = bool(re.search(r'[A-Za-z]', s))
+            is_symbols_only = not has_hebrew and not has_latin
+
+            if is_symbols_only and merged:
+                merged[-1] = merged[-1] + original
+            elif is_symbols_only and not merged:
+                merged.append(original)
+            else:
+                if merged:
+                    prev = merged[-1].strip()
+                    prev_has_hebrew = bool(re.search(r'[\u0590-\u05FF]', prev))
+                    prev_has_latin = bool(re.search(r'[A-Za-z]', prev))
+                    if not prev_has_hebrew and not prev_has_latin:
+                        merged[-1] = merged[-1] + original
+                        continue
+                merged.append(original)
+
+        # שלב 3: איחוד חלקים רצופים באותה שפה
+        consolidated = []
+        for part in merged:
+            s = part.strip()
+            if not s:
+                continue
+            has_hebrew = bool(re.search(r'[\u0590-\u05FF]', s))
+            has_latin = bool(re.search(r'[A-Za-z]', s))
+            current_lang = "he" if has_hebrew else ("en" if has_latin else "symbols")
+
+            if consolidated:
+                prev_text = consolidated[-1].strip()
+                prev_has_hebrew = bool(re.search(r'[\u0590-\u05FF]', prev_text))
+                prev_has_latin = bool(re.search(r'[A-Za-z]', prev_text))
+                prev_lang = "he" if prev_has_hebrew else ("en" if prev_has_latin else "symbols")
+
+                if current_lang == prev_lang or current_lang == "symbols" or prev_lang == "symbols":
+                    consolidated[-1] = consolidated[-1] + part
+                    continue
+
+            consolidated.append(part)
+
+        # שלב 4: סינון סופי
+        result = []
+        for part in consolidated:
+            s = part.strip()
+            if s:
+                result.append(s)
+        return result
 
     async def generate_natural_audio(self, sentence, idx):
         """
         מפצל משפט לפי שפה (עברית/אנגלית) ומייצר אודיו עם הקול המתאים לכל חלק.
+        חותך שקט מקצוות כל קטע ומוסיף הפסקה מבוקרת (pause_lang) בין חילופי שפה.
         """
-        # פיצול: תופס רצפי אותיות לטיניות (כולל רווחים בין מילים אנגליות)
-        parts = re.split(r'([A-Za-z][A-Za-z\s\'\-\.]*[A-Za-z]|[A-Za-z]+)', sentence)
+        # פיצול: תופס רצפי אותיות לטיניות כולל ספרות מעורבות (OATP1B1, CYP3A4, P450)
+        raw_parts = re.split(r'([A-Za-z][A-Za-z0-9\s\'\-\.]*[A-Za-z0-9]|[A-Za-z]+)', sentence)
+
+        # איחוד חלקים קטנים (סימנים, סוגריים) עם השכנים שלהם
+        parts = self._merge_language_parts(raw_parts)
 
         combined = AudioSegment.empty()
         has_audio = False
+        prev_lang = None
 
-        for part in parts:
-            part_stripped = part.strip()
+        # הפסקה מבוקרת בין חילופי שפה
+        pause_lang = self.settings.get("pause_lang", 80)
+        lang_silence = AudioSegment.silent(duration=pause_lang, frame_rate=24000) if pause_lang > 0 else None
+
+        for part_stripped in parts:
             if not part_stripped:
                 continue
 
             # בדיקה אם החלק מכיל אותיות לטיניות
             is_english = bool(re.search(r'[A-Za-z]', part_stripped))
             voice = self.en_voice if is_english else self.he_voice
+            current_lang = "en" if is_english else "he"
 
             audio_bytes = await self.fetch_audio_internal(part_stripped, voice, idx)
             if audio_bytes:
                 segment = await self.loop.run_in_executor(None, self.bytes_to_audio, audio_bytes, idx)
                 if len(segment) > 0:
+                    # הוספת הפסקה מבוקרת רק כשיש חילוף שפה בפועל
+                    if has_audio and lang_silence and prev_lang is not None and prev_lang != current_lang:
+                        combined += lang_silence
                     combined += segment
                     has_audio = True
+                    prev_lang = current_lang
 
         if has_audio:
             return combined
