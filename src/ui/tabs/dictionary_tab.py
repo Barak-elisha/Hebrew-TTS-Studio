@@ -108,10 +108,8 @@ class DictionaryTab(QWidget):
         self.table_nikud.setRowCount(0)
         self.table_nikud.clearContents()
         
-        # --- התיקון: שימוש במשתנה עזר שמצביע להגדרות בחלון הראשי ---
         settings = self.main_window.settings 
         
-        # עכשיו כל הגישות הן דרך המשתנה settings התקין
         dictionary = settings.get("nikud_dictionary", {})
         metadata = settings.get("nikud_metadata", {}) 
         
@@ -119,7 +117,6 @@ class DictionaryTab(QWidget):
         
         for base in sorted_keys:
             vocalized = dictionary[base]
-            # שימוש ב-metadata התקין
             data = metadata.get(base, {})
             date_added = data.get("date", "-")
             match_type = data.get("match_type", "partial")
@@ -129,13 +126,8 @@ class DictionaryTab(QWidget):
     def refresh_errors_table(self):
         """רענון טבלת הטעויות"""
         if not self.main_window: return
-        # משתמשים בפונקציה המובנית של ErrorsTableWidget
-        # אבל צריך לוודא שאנחנו מעבירים לה את הרשימה הנכונה
         errors_list = self.main_window.settings.get("nikud_errors", [])
         
-        # הערה: ErrorsTableWidget מצפה ל-settings בתוך ה-main_window שהעברנו לה ב-init
-        # אז אם בנינו אותה נכון, זה אמור לעבוד אוטומטית, או שנפעיל פונקציית עזר.
-        # נניח שיש לה פונקציה load_data כפי שהגדרנו קודם.
         if hasattr(self.table_errors, 'load_data'):
             self.table_errors.load_data(errors_list)
 
@@ -146,8 +138,6 @@ class DictionaryTab(QWidget):
             self.refresh_errors_table()
 
     def add_manual_word(self):
-        word, ok = QLineEdit.getText(self, "הוספה מהירה", "הקלד מילה (ללא ניקוד):") # נשתמש ב-InputDialog רגיל או QInputDialog
-        # עדיף QInputDialog אבל צריך לייבא אותו. לשם הפשטות נשתמש ב-QInputDialog
         from PyQt5.QtWidgets import QInputDialog
         word, ok = QInputDialog.getText(self, "הוספה מהירה", "הקלד מילה (ללא ניקוד):")
         
@@ -166,8 +156,11 @@ class DictionaryTab(QWidget):
         self.highlight_word_in_table(self.clean_nikud_from_string(base_word))
         self.main_window.lbl_status.setText(f"✅ נוסף: {base_word}")
 
-    def add_or_update_word(self, base_word, vocalized_word, match_type):
-        """הוספה למילון ושמירה"""
+    def add_or_update_word(self, base_word, vocalized_word, match_type, update_table_ui=True):
+        """
+        הוספה למילון ושמירה.
+        update_table_ui=False -> מאפשר לערוך ישירות בטבלה מבלי שהיא תתרענן ותאבד פוקוס.
+        """
         key = self.clean_nikud_from_string(base_word)
         if not key: return
 
@@ -180,7 +173,10 @@ class DictionaryTab(QWidget):
             "match_type": match_type
         }
         self.main_window.save_settings()
-        self.refresh_dictionary_table()
+        
+        # רענון הטבלה רק אם התבקש (ברירת מחדל: כן)
+        if update_table_ui:
+            self.refresh_dictionary_table()
 
     def delete_selected_from_dict(self):
         """מחיקת שורות מסומנות מהמילון"""
@@ -213,9 +209,7 @@ class DictionaryTab(QWidget):
             self.table_nikud.selectRow(item.row())
             self.table_nikud.scrollToItem(item, QAbstractItemView.PositionAtCenter)
 
-    # פונקציה זו נקראת על ידי ErrorsTableWidget בעת דאבל קליק או לחיצה על "תיקון"
     def open_fix_dialog_for_error(self, word_with_nikud):
-        # כדי לאפשר לטבלה לקרוא לפונקציה, נוודא ש-ErrorsTableWidget קורא לזה
         dialog = NikudEditorDialog(word_with_nikud, self.main_window)
         dialog.chk_add_to_dict.setChecked(True)
         dialog.chk_add_to_dict.setEnabled(False)
@@ -226,7 +220,7 @@ class DictionaryTab(QWidget):
             match_type = "exact" if match_idx == 1 else "partial"
             
             # הוספה למילון
-            self.add_or_update_word(corrected, corrected, match_type) # המפתח מחושב בפנים
+            self.add_or_update_word(corrected, corrected, match_type) 
             
             # הסרה מרשימת הטעויות
             errors = self.main_window.settings.get("nikud_errors", [])

@@ -6,13 +6,14 @@ from datetime import datetime
 from PyQt5.QtCore import Qt, QUrl
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (
-    QTableWidget,QDialog, QTableWidgetItem, QPushButton, QHBoxLayout, 
+    QTableWidget, QDialog, QTableWidgetItem, QPushButton, QHBoxLayout, 
     QWidget, QComboBox, QHeaderView, QAbstractItemView
 )
-# ייבוא של הדיאלוג והוורקרים מהתיקיות החדשות שיצרנו
+
+# ייבוא של הדיאלוג והוורקרים
 from src.ui.dialogs.nikud_editor import NikudEditorDialog
 from src.workers.nikud_worker import NikudWorker
-from src.workers.tts_worker import AudioPreviewWorker # אם השארת את ה-PreviewWorker שם
+from src.workers.tts_worker import AudioPreviewWorker
 
 class PasteableTableWidget(QTableWidget):
     """טבלה משודרגת עם תיקון שמירה אוטומטית"""
@@ -35,83 +36,62 @@ class PasteableTableWidget(QTableWidget):
         """פונקציית עזר למציאת החלון הראשי"""
         parent = self.parent()
         while parent:
-            if hasattr(parent, 'add_or_update_word'):
+            if hasattr(parent, 'add_or_update_word'): # מזהה ייחודי של DictionaryTab/MainWindow
                 return parent
             parent = parent.parent()
         return None
 
     def on_item_changed(self, item):
-        # אם אנחנו באמצע עדכון תוכנתי - מתעלמים כדי לא ליצור לולאה
         if self.signalsBlocked(): return
 
         row = item.row()
         col = item.column()
         
-        print(f"[DEBUG-TABLE] Change detected at Row {row}, Col {col}. Text: '{item.text()}'")
-
         base_item = self.item(row, 0)
         voc_item = self.item(row, 2)
         
         if not base_item: return
         base_word = base_item.text().strip()
         
-        # 1. זיהוי מילה חדשה (עמודה 0) -> ניקוד אוטומטי
+        # 1. מילה חדשה -> ניקוד אוטומטי
         if col == 0 and base_word:
             if not voc_item or not voc_item.text().strip():
-                print(f"[DEBUG-TABLE] New word detected. Sending to Auto-Nikud...")
                 self.auto_nikud_single_word(base_word, row)
                 return
 
-        # 2. זיהוי עריכת ניקוד (עמודה 2) -> שמירה
+        # 2. עריכת ניקוד -> שמירה
         if col == 2:
-            vocalized_word = item.text().strip() # לוקחים את הטקסט העדכני מהתא שערכת
-            
-            # אם מחקת את הניקוד לגמרי, לא נשמור מילה ריקה
+            vocalized_word = item.text().strip()
             if not vocalized_word: return
 
-            print(f"[DEBUG-TABLE] Saving update for '{base_word}' -> '{vocalized_word}'")
-            
-            # בדיקת סוג ההתאמה
             match_type = "partial"
             cell_widget = self.cellWidget(row, 4)
             if cell_widget:
                 combo = cell_widget.findChild(QComboBox)
                 if combo: match_type = "exact" if combo.currentIndex() == 1 else "partial"
             
-            # קריאה לחלון הראשי
             main_window = self.find_main_window()
             if main_window:
-                # חשוב מאוד: update_table_ui=False
-                # כי אנחנו כבר רואים את השינוי בטבלה (אנחנו כתבנו אותו!)
-                main_window.add_or_update_word(base_word, vocalized_word, match_type, update_table_ui=False)
-            else:
-                print("[ERROR] Could not find Main Window to save settings!")
+                # שימוש ב-getattr לבדיקה אם הפונקציה קיימת (למקרה שההיררכיה שונה)
+                if hasattr(main_window, 'add_or_update_word'):
+                    main_window.add_or_update_word(base_word, vocalized_word, match_type, update_table_ui=False)
 
     def open_big_editor(self, row, column):
         if column == 2: # עריכת המילה המנוקדת
             item = self.item(row, column)
             current_text = item.text() if item else ""
             
-            # הנחה: הדיאלוג מוגדר בקובץ
-            # אנחנו צריכים להעביר את החלון הראשי כהורה או למצוא אותו בתוך הדיאלוג
             main_win = self.find_main_window()
-            dialog = NikudEditorDialog(current_text, self) 
-            
-            # "הזרקת" החלון הראשי לדיאלוג כדי שהשמע יעבוד
-            dialog.parent_window = main_win 
+            dialog = NikudEditorDialog(current_text, main_win) 
             
             if dialog.exec_() == QDialog.Accepted:
                 new_text = dialog.get_text()
-                self.blockSignals(True) # חוסמים כדי ש-on_item_changed לא יקפוץ כפול
+                self.blockSignals(True)
                 self.setItem(row, column, QTableWidgetItem(new_text))
                 self.blockSignals(False)
-                
-                # עכשיו קוראים ידנית לשמירה
-                # אנחנו מדמים כאילו ItemChanged קרה
                 self.on_item_changed(self.item(row, column))
 
     def auto_nikud_single_word(self, word, row):
-        # מניח ש-NikudWorker קיים בקובץ
         worker = NikudWorker(word)
         self.active_workers.append(worker)
         worker.finished.connect(lambda res: self.fill_nikud_result(res, row))
@@ -123,36 +103,30 @@ class PasteableTableWidget(QTableWidget):
             self.active_workers.remove(worker)
 
     def fill_nikud_result(self, result_text, row):
-        # ממלא את התא ושומר
         self.blockSignals(True)
         self.setItem(row, 2, QTableWidgetItem(result_text))
-        
-        # וידוא כפתורים
         if self.cellWidget(row, 1) is None: self.set_play_button(row, 1)
         if self.cellWidget(row, 3) is None: self.set_play_button(row, 3)
-        
         self.blockSignals(False)
-        
-        # שמירה אוטומטית אחרי שהניקוד הגיע
         self.on_item_changed(self.item(row, 2))
 
-    # --- פונקציות עזר קיימות (ללא שינוי, רק מוודא שהן כאן) ---
     def delete_selected_rows(self):
         rows = sorted(set(index.row() for index in self.selectedIndexes()), reverse=True)
         if not rows: return
         
-        # מחיקה מהזיכרון ומהקובץ
         main_win = self.find_main_window()
-        if main_win:
+        if main_win and hasattr(main_win, 'settings'):
             current_dict = main_win.settings.get("nikud_dictionary", {})
             for r in rows:
                 item = self.item(r, 0)
                 if item:
-                    key = main_win.clean_nikud_from_string(item.text())
+                    # מנקה ניקוד למפתח
+                    normalized = unicodedata.normalize('NFD', item.text())
+                    key = "".join([c for c in normalized if not unicodedata.combining(c) and (c.isalnum() or c.isspace())]).strip()
                     if key in current_dict:
                         del current_dict[key]
             
-            main_win.save_settings() # שמירה אחרי המחיקה
+            main_win.save_settings()
             
         for r in rows:
             self.removeRow(r)
@@ -171,7 +145,6 @@ class PasteableTableWidget(QTableWidget):
         cmb_match.addItems(["חלקי (חכם)", "מדויק בלבד"])
         cmb_match.setCurrentIndex(1 if match_type == "exact" else 0)
         cmb_match.setStyleSheet("QComboBox { font-size: 13px; padding: 4px; margin: 2px; }")
-        # חיבור לאירוע שינוי בקומבו בוקס לשמירה מיידית
         cmb_match.currentIndexChanged.connect(lambda: self.on_combo_changed(row))
         
         container = QWidget(); layout = QHBoxLayout(container); layout.setContentsMargins(5, 0, 5, 0); layout.setAlignment(Qt.AlignCenter)
@@ -186,8 +159,6 @@ class PasteableTableWidget(QTableWidget):
         self.blockSignals(False)
 
     def on_combo_changed(self, row):
-        """שמירה כשמשנים את סוג ההתאמה בקומבו בוקס"""
-        # מדמים שינוי בטבלה כדי להפעיל את מנגנון השמירה
         item = self.item(row, 2)
         if item: self.on_item_changed(item)
 
@@ -205,7 +176,6 @@ class PasteableTableWidget(QTableWidget):
         index = self.indexAt(btn.parent().pos())
         if not index.isValid(): return
         
-        # מנגן את הטקסט בעמודה המתאימה (0 או 2)
         text_col = 0 if index.column() == 1 else 2
         item = self.item(index.row(), text_col)
         if item: self.play_preview(item.text())
@@ -213,13 +183,23 @@ class PasteableTableWidget(QTableWidget):
     def play_preview(self, text):
         if not text: return
         main_win = self.find_main_window()
-        if not main_win: return
         
+        # === התיקון הגדול: איתור ההגדרות מתוך MainEditTab ===
+        voice_id = "he-IL-AvriNeural" # ברירת מחדל
+        speed = "+0%"
+        
+        # 1. ניסיון לגשת דרך החלון הראשי לטאב העריכה
+        if main_win and hasattr(main_win, 'main_window'): # אם אנחנו ב-Tab, ההורה הוא ה-Main Window
+             main_win = main_win.main_window
+        
+        if main_win and hasattr(main_win, 'tab_edit'):
+            tab_edit = main_win.tab_edit
+            voice_name = tab_edit.combo_he.currentText()
+            voice_id = tab_edit.he_voices.get(voice_name, voice_id)
+            speed = tab_edit.combo_speed.currentText()
+        # ====================================================
+
         try:
-            voice_name = main_win.combo_he.currentText()
-            voice_id = main_win.he_voices.get(voice_name, "he-IL-AvriNeural")
-            speed = main_win.combo_speed.currentText()
-            
             unique_str = f"{text}_{voice_id}_{speed}"
             cache_key = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
             
@@ -232,7 +212,8 @@ class PasteableTableWidget(QTableWidget):
             worker.finished_data.connect(self.on_download_complete)
             worker.finished_data.connect(lambda: self.cleanup_worker(worker))
             worker.start()
-        except: pass
+        except Exception as e:
+            print(f"Error playing preview: {e}")
 
     def on_download_complete(self, cache_key, data):
         self.memory_cache[cache_key] = data
@@ -256,4 +237,3 @@ class PasteableTableWidget(QTableWidget):
             t1 = self.item(row, 0).text() if self.item(row, 0) else ""
             t2 = self.item(row, 2).text() if self.item(row, 2) else ""
             self.setRowHidden(row, not (query in t1 or query in t2))
-

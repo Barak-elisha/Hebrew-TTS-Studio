@@ -1,43 +1,99 @@
 import re
-import unicodedata
 
 def remove_nikud(text):
-    """מסירה את כל סימני הניקוד מהטקסט"""
+    """מסיר ניקוד מטקסט עברי"""
     if not text: return ""
-    normalized = unicodedata.normalize('NFKD', text)
-    return "".join([c for c in normalized if not unicodedata.combining(c)])
+    return re.sub(r'[\u0591-\u05C7]', '', text)
 
-def cleanup_pdf_page(page_text):
-    """ניקוי טקסט של עמוד בודד מ-PDF (מותאם ל-pdfplumber layout mode)"""
-    if not page_text:
-        return ""
-    # הסרת תווים בלתי נראים (LTR/RTL marks)
-    page_text = re.sub(r'[\u200e\u200f\u202a-\u202e]', '', page_text)
-    # סינון שורות שהן רק מספרי עמוד בודדים
-    lines = page_text.split('\n')
-    filtered = [l for l in lines if not re.match(r'^\s*\d+\s*$', l.strip())]
-    page_text = '\n'.join(filtered)
-    # תיקון סימני פיסוק RTL: ב-PDF עברי, סימני פיסוק מופיעים לפעמים בתחילת השורה
-    # דבוקים למילה (למשל ".פינוייה" במקום "פינוייה.")
-    lines = page_text.split('\n')
-    lines = [re.sub(r'^([.!?,;:"\u05F4]+)(\S+)', r'\2\1', l) for l in lines]
-    # תיקון סדר גרשיים-נקודה: word." -> word".
-    lines = [re.sub(r'\.(")', r'\1.', l) for l in lines]
-    page_text = '\n'.join(lines)
-    # צמצום רווחים כפולים בתוך שורות
-    page_text = re.sub(r' +', ' ', page_text)
-    # צמצום שורות ריקות מרובות
-    page_text = re.sub(r'\n{3,}', '\n\n', page_text)
-    return page_text.strip()
-
+def cleanup_pdf_page(text):
+    """ניקוי בסיסי (ישן) - נשמר לתאימות"""
+    return text.replace("\xa0", " ").strip()
 
 def advanced_cleanup(text):
-    """ניקוי כללי של תווים לא רצויים וסידור רווחים"""
+    """ניקוי מתקדם של תווים מיוחדים"""
     if not text: return ""
-    # הסרת תווים בלתי נראים (LTR/RTL marks)
-    text = re.sub(r'[\u200e\u200f\u202a-\u202e]', '', text)
-    # צמצום רווחים כפולים
-    text = re.sub(r' +', ' ', text)
-    # צמצום שורות ריקות מרובות
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    text = text.replace("\u200f", "").replace("\u200e", "")  # הסרת תווי כיווניות
+    text = text.replace("\xa0", " ")
+    text = re.sub(r'[\r\n]+', '\n', text)
+    return text
+
+# === הפונקציות החדשות שחילצנו מהייבוא הראשי ===
+
+def smart_clean_page_text(page_text):
+    """
+    מבצע את הניקוי החכם ברמת העמוד:
+    - סינון שורות זבל ומספרי עמודים
+    - תיקון היפוך פיסוק (RTL)
+    - איחוד שורות פיסוק יתומות
+    - איחוד פסקאות חכם (Smart Join)
+    """
+    if not page_text:
+        return ""
+
+    # 1. ניקוי שורות זבל
+    lines = page_text.split('\n')
+    total_lines = len(lines)
+    cleaned_lines = []
+    for line_idx, line in enumerate(lines):
+        stripped = line.strip()
+        if len(stripped) == 0:
+            continue
+        # סינון מספרי עמודים: מספר בודד שמוקף בשורות ריקות
+        if re.match(r'^\s*\d+\s*$', stripped):
+            prev_empty = (line_idx == 0) or not lines[line_idx - 1].strip()
+            next_empty = (line_idx >= total_lines - 1) or not lines[line_idx + 1].strip()
+            if prev_empty or next_empty:
+                continue
+        if len(stripped) == 1 and not re.match(r'[.!?,;:)(a-zA-Z0-9\u0590-\u05FF]', stripped):
+            continue
+        cleaned_lines.append(stripped)
+
+    # 2. תיקון סימני פיסוק RTL
+    for k in range(len(cleaned_lines)):
+        # העברת סימן פיסוק מתחילת השורה לסוף המילה שדבוקה אליו
+        cleaned_lines[k] = re.sub(r'^([.!?,;:"\u05F4]+)(\S+)', r'\2\1', cleaned_lines[k])
+        # תיקון סדר גרשיים-נקודה
+        cleaned_lines[k] = re.sub(r'\.(")', r'\1.', cleaned_lines[k])
+
+    # 3. איחוד שורות פיסוק בודדות לשורה הקודמת
+    merged_lines = []
+    for line in cleaned_lines:
+        if merged_lines and re.match(r'^[.!?,;:)(–\-\]\[]+$', line):
+            merged_lines[-1] += line
+        else:
+            merged_lines.append(line)
+    cleaned_lines = merged_lines
+
+    # 4. איחוד פסקאות חכם (Smart Join)
+    smart_text = ""
+    for j, line in enumerate(cleaned_lines):
+        if j > 0:
+            prev_line = cleaned_lines[j-1]
+            current_starts_with_punct = line and line[0] in '.!?,;:'
+            
+            if current_starts_with_punct:
+                pass
+            elif prev_line.endswith(('.', '!', '?', ':', ';', '"')):
+                smart_text += "\n"
+            else:
+                smart_text += " "
+        smart_text += line
+
+    return smart_text
+
+def finalize_text_processing(full_text):
+    """
+    מבצע את הפוליש הסופי על כל הטקסט (Regex Post-Processing)
+    """
+    # ניקוי כללי
+    final_text = advanced_cleanup(full_text)
+    
+    # תיקונים טיפוגרפיים ספציפיים
+    final_text = re.sub(r'\.([^\s\n\d])', r'. \1', final_text)   # רווח אחרי נקודה (לא לפני ספרה - מספרים עשרוניים)
+    final_text = re.sub(r',([^\s\n])', r', \1', final_text)   # רווח אחרי פסיק
+    final_text = re.sub(r' {2,}', ' ', final_text)            # צמצום רווחים כפולים
+    final_text = re.sub(r'\s+([.,!?;:])', r'\1', final_text)  # ביטול רווח לפני פיסוק
+    final_text = re.sub(r'\(\s+', '(', final_text)            # ביטול רווח אחרי סוגריים פותחים
+    final_text = re.sub(r'\s+\)', ')', final_text)            # ביטול רווח לפני סוגריים סוגרים
+
+    return final_text.strip()

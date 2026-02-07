@@ -204,7 +204,7 @@ class ErrorsTableWidget(QTableWidget):
     def find_main_window(self):
         p = self.parent()
         while p:
-            if hasattr(p, 'add_or_update_word'): return p
+            if hasattr(p, 'settings') and hasattr(p, 'save_settings'): return p
             p = p.parent()
         return None
 

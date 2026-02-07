@@ -63,7 +63,7 @@ class NikudTextEdit(QTextEdit):
             fmt.setFontUnderline(True)
             cursor.setCharFormat(fmt)
             
-            if self.parent_window:
+            if self.parent_window and hasattr(self.parent_window, 'add_error_to_review'):
                 self.parent_window.add_error_to_review(text)
         else:
             # === ביטול טעות (חזרה לרגיל) ===
@@ -74,7 +74,7 @@ class NikudTextEdit(QTextEdit):
             
             cursor.setCharFormat(default_fmt)
             
-            if self.parent_window:
+            if self.parent_window and hasattr(self.parent_window, 'remove_error_from_review'):
                 self.parent_window.remove_error_from_review(text)
 
     def add_to_dictionary_direct(self, original, new_val, match_index):

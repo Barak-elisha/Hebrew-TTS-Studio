@@ -10,7 +10,7 @@ from PyQt5.QtCore import Qt, QUrl
 from PyQt5.QtGui import QFont
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 
-# ייבוא ה-Worker של האודיו (חשוב להשמעה מהירה)
+# ייבוא ה-Worker של האודיו
 from src.workers.tts_worker import AudioPreviewWorker
 
 class NikudEditorDialog(QDialog):
@@ -57,13 +57,14 @@ class NikudEditorDialog(QDialog):
         
         layout.addLayout(top_layout)
         
-        # --- אפשרויות הוספה למילון (יופיעו רק כשבאים מהאדיטור) ---
+        # --- אפשרויות הוספה למילון ---
         self.dict_options_frame = QFrame()
         dict_layout = QHBoxLayout(self.dict_options_frame)
         dict_layout.setContentsMargins(0, 10, 0, 10)
         
         self.chk_add_to_dict = QCheckBox("הוסף מילה זו למילון")
         self.chk_add_to_dict.setStyleSheet("font-size: 14px; font-weight: bold; color: #2C3E50;")
+        self.chk_add_to_dict.setChecked(True) # ברירת מחדל
         
         self.combo_match_type = QComboBox()
         self.combo_match_type.addItems(["התאמה חלקית (חכם)", "התאמה מדויקת בלבד"])
@@ -78,7 +79,6 @@ class NikudEditorDialog(QDialog):
         
         # --- מקלדת הניקוד (מעודכן וגדול) ---
         grid_layout = QGridLayout()
-        # רשימה עם סימני עזר ויזואליים
         chars = [
             ('ְ', 'שְווא', '◌ְ'), ('ֱ', 'חטף סגול', '◌ֱ'), ('ֲ', 'חטף פתח', '◌ֲ'), ('ֳ', 'חטף קמץ', '◌ֳ'),
             ('ִ', 'חיריק', '◌ִ'), ('ֵ', 'צירה', '◌ֵ'), ('ֶ', 'סגול', '◌ֶ'), ('ַ', 'פתח', '◌ַ'),
@@ -89,10 +89,9 @@ class NikudEditorDialog(QDialog):
         row, col = 0, 0
         for char, name, display in chars:
             btn = QPushButton()
-            btn.setFixedSize(100, 80) # כפתורים גדולים
+            btn.setFixedSize(100, 80)
             btn.setFocusPolicy(Qt.NoFocus)
             
-            # עיצוב הכפתור
             btn.setStyleSheet("""
                 QPushButton { 
                     background-color: #334E68; 
@@ -103,15 +102,12 @@ class NikudEditorDialog(QDialog):
                 QPushButton:pressed { background-color: #1E8449; }
             """)
             
-            # שימוש ב-HTML להצגת הניקוד בגדול
             btn_text = f"<html><div style='text-align:center;'><span style='font-size:32px; color: white; font-weight:bold;'>{display}</span><br><span style='font-size:11px; color:#D9E2EC;'>{name}</span></div></html>"
             
-            # במקום setText רגיל, נשתמש ב-QLabel פנימי כדי שה-HTML יעבוד בטוח
             layout_btn = QVBoxLayout(btn)
             layout_btn.setContentsMargins(0,0,0,0)
             lbl = QLabel(btn_text)
             lbl.setAlignment(Qt.AlignCenter)
-            # מעבירים את הקליקים מהלייבל לכפתור
             lbl.setAttribute(Qt.WA_TransparentForMouseEvents) 
             layout_btn.addWidget(lbl)
 
@@ -127,7 +123,6 @@ class NikudEditorDialog(QDialog):
         # --- כפתורים תחתונים ---
         btn_layout = QHBoxLayout()
         
-        # כפתור סמן כטעות (אדום)
         btn_mark_error = QPushButton("🚩 סמן כטעות")
         btn_mark_error.setFont(QFont("Arial", 12, QFont.Bold))
         btn_mark_error.setStyleSheet("background-color: #C0392B; color: white; padding: 10px;")
@@ -158,37 +153,55 @@ class NikudEditorDialog(QDialog):
         return self.input_text.text()
     
     def mark_as_error(self):
-        # מחזיר קוד מיוחד (222) כדי שהאדיטור ידע לצבוע באדום
         self.done(222)
 
     def play_preview(self):
+        """מנגן את הטקסט, תוך חיפוש חכם של הגדרות הקול בטאב העריכה"""
         text = self.input_text.text().strip()
         if not text: return
+        
         try:
-            # מנסה למצוא את החלון הראשי דרך השרשור של ה-parents
-            # אם הוא נפתח מתוך NikudTextEdit, ה-parent שלו הוא NikudTextEdit, וה-parent שלו הוא MainWindow
+            # 1. איתור החלון הראשי (MainWindow) בצורה בטוחה
             main_win = None
-            curr = self.parent()
-            while curr:
-                if hasattr(curr, 'combo_he'): # זיהוי של החלון הראשי
-                    main_win = curr
-                    break
-                if hasattr(curr, 'parent_window'): # אם זה AnalysisDialog או NikudTextEdit
-                    main_win = curr.parent_window
-                    break
-                curr = curr.parent()
+            
+            # בדיקה אם הועבר לנו parent_window מפורש (כמו שעשינו בטבלה)
+            if hasattr(self, 'parent_window') and self.parent_window:
+                # בדיקה אם זה כבר החלון הראשי או שצריך לעלות למעלה
+                if hasattr(self.parent_window, 'tab_edit'):
+                    main_win = self.parent_window
+                elif hasattr(self.parent_window, 'main_window'):
+                    main_win = self.parent_window.main_window
+            
+            # אם לא מצאנו, ננסה לטפס בהיררכיה הרגילה של Qt
+            if not main_win:
+                curr = self.parent()
+                while curr:
+                    if hasattr(curr, 'tab_edit'): # זה הסימן המובהק ל-MainWindow החדש
+                        main_win = curr
+                        break
+                    curr = curr.parent()
 
-            if main_win:
-                voice_name = main_win.combo_he.currentText()
-                voice_id = main_win.he_voices.get(voice_name, "he-IL-AvriNeural")
-                speed = main_win.combo_speed.currentText()
-                
-                unique_str = f"{text}_{voice_id}_{speed}"
-                cache_key = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
-                
-                self.worker = AudioPreviewWorker(cache_key, text, voice_id, speed)
-                self.worker.finished_data.connect(self.play_audio_bytes)
-                self.worker.start()
+            # 2. שליפת ההגדרות מתוך MainEditTab
+            voice_id = "he-IL-AvriNeural" # ברירת מחדל
+            speed = "+0%"
+
+            if main_win and hasattr(main_win, 'tab_edit'):
+                tab = main_win.tab_edit
+                # וודא שהרכיבים קיימים בטאב
+                if hasattr(tab, 'combo_he'):
+                    voice_name = tab.combo_he.currentText()
+                    voice_id = tab.he_voices.get(voice_name, voice_id)
+                if hasattr(tab, 'combo_speed'):
+                    speed = tab.combo_speed.currentText()
+            
+            # 3. הפעלת ה-Worker להשמעה
+            unique_str = f"{text}_{voice_id}_{speed}"
+            cache_key = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
+            
+            self.worker = AudioPreviewWorker(cache_key, text, voice_id, speed)
+            self.worker.finished_data.connect(self.play_audio_bytes)
+            self.worker.start()
+            
         except Exception as e:
             print(f"Preview Error: {e}")
 

@@ -3,6 +3,7 @@ import re
 import difflib
 import PyPDF2
 import fitz  # PyMuPDF
+import unicodedata
 from datetime import datetime
 from collections import Counter
 
@@ -26,11 +27,13 @@ from src.utils.text_tools import advanced_cleanup, cleanup_pdf_page
 class MainEditTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.main_window = parent  # הפניה לחלון הראשי כדי לגשת להגדרות ולסטטוס
+        self.main_window = parent
         
         # נתונים מקומיים לטאב
         self.file_path = ""
         self.file_paths = []
+        self.active_placeholders = {} # משתנה לשמירת התגיות המוסתרות
+        
         self.he_voices = {
             "Hila (אישה - עברית)": "he-IL-HilaNeural", 
             "Avri (גבר - עברית)": "he-IL-AvriNeural"
@@ -98,7 +101,6 @@ class MainEditTab(QWidget):
         
         row2.addWidget(QLabel("קול עברי:"))
         self.combo_he = QComboBox(); self.combo_he.addItems(list(self.he_voices.keys())); self.combo_he.setFixedWidth(150); self.combo_he.setStyleSheet(combo_style)
-        # שחזור בחירה מהגדרות
         if self.main_window and "selected_he_voice" in self.main_window.settings:
              self.combo_he.setCurrentText(self.main_window.settings["selected_he_voice"])
         row2.addWidget(self.combo_he)
@@ -156,7 +158,7 @@ class MainEditTab(QWidget):
         
         right_layout.addWidget(frame_tools)
 
-        self.editor = NikudTextEdit(self.main_window) # חשוב: parent הוא החלון הראשי לדיאלוגים
+        self.editor = NikudTextEdit(self.main_window)
         self.editor.setFont(QFont("Arial", 14))
         self.editor.setLayoutDirection(Qt.RightToLeft)
         self.editor.textChanged.connect(self.update_char_count)
@@ -167,26 +169,27 @@ class MainEditTab(QWidget):
         self.splitter.setSizes([600, 600])
         layout.addWidget(self.splitter, 1)
 
-        # כפתור המרה
         self.btn_convert = QPushButton("🚀 צור קובץ MP3")
         self.btn_convert.setFixedHeight(42)
         self.btn_convert.setStyleSheet("background-color: #F76707; font-size: 16px; font-weight: bold;")
         self.btn_convert.clicked.connect(self.start_export_process)
         layout.addWidget(self.btn_convert)
 
-    # ==========================
-    # LOGIC FUNCTIONS MOVED HERE
-    # ==========================
+    # ============================================
+    # === פונקציית עזר לניקוי תגיות ל-TTS ===
+    # ============================================
+    def clean_tags_for_tts(self, text):
+        """מסיר תגיות מערכת כדי שה-TTS לא יקריא אותן"""
+        if not text: return ""
+        # מסיר [FILE:...], [PAGE:...], [IMG:...]
+        return re.sub(r'\[(?:FILE|PAGE|IMG):.*?\]', '', text).strip()
 
     def load_pdf(self):
-        # שימוש ב-getOpenFileNames (ברבים) במקום getOpenFileName
-        last_dir = os.path.dirname(self.file_path) if self.file_path else ''
+        last_dir = os.path.dirname(self.file_path) if self.file_path else os.path.expanduser("~")
         fnames, _ = QFileDialog.getOpenFileNames(self, 'בחר קבצי PDF (ניתן לבחור כמה)', last_dir, "PDF Files (*.pdf)")
-
         if fnames:
-            # הוספה לרשימה קיימת (לתמיכה בייבוא מתיקיות שונות)
             self.file_paths.extend(fnames)
-            # הסרת כפילויות תוך שמירה על סדר
+            # הסרת כפילויות
             seen = set()
             unique = []
             for f in self.file_paths:
@@ -194,15 +197,17 @@ class MainEditTab(QWidget):
                     seen.add(f)
                     unique.append(f)
             self.file_paths = unique
+            
             self.file_path = self.file_paths[0]
-
-            # עדכון התצוגה למשתמש
             if len(self.file_paths) == 1:
                 self.lbl_file.setText(os.path.basename(self.file_paths[0]))
             else:
                 self.lbl_file.setText(f"נבחרו {len(self.file_paths)} קבצים")
-
-            # חישוב סך העמודים מכל הקבצים יחד
+            
+            # טעינה ראשונית
+            if hasattr(self, 'pdf_viewer'):
+                self.pdf_viewer.load_pdf(self.file_path)
+            
             total_pages_count = 0
             for f in self.file_paths:
                 try:
@@ -210,29 +215,23 @@ class MainEditTab(QWidget):
                         reader = PyPDF2.PdfReader(pdf_file)
                         total_pages_count += len(reader.pages)
                 except: pass
-
+            
             self.input_start.setText("1")
             self.input_end.setText(str(total_pages_count))
             clean_name = os.path.splitext(os.path.basename(self.file_paths[0]))[0]
             self.input_filename.setText(clean_name)
 
     def extract_text(self):
-        """
-        גרסה משופרת הכוללת ניקוי מתקדם של פיסוק, סוגריים ואיחוד פסקאות חכם.
-        """
         if not hasattr(self, 'file_paths') or not self.file_paths:
             QMessageBox.warning(self, "שגיאה", "לא נבחרו קבצים.")
             return
-
+        
         self.main_window.lbl_status.setText("מייבא טקסט ומבצע ניקוי מתקדם...")
         self.main_window.progress_bar.setValue(0)
-
-        if hasattr(self, 'pdf_viewer'):
-            self.pdf_viewer.load_pdf(self.file_paths[0])
-
+        
         full_text_accumulator = ""
         total_files = len(self.file_paths)
-
+        
         try:
             for idx, f_path in enumerate(self.file_paths):
                 try:
@@ -241,41 +240,44 @@ class MainEditTab(QWidget):
                 except Exception as e:
                     print(f"Error reading PDF {f_path}: {e}")
                     continue
-
+                
                 txt_start = self.input_start.text().strip() or "1"
                 txt_end = self.input_end.text().strip() or str(total_pages)
                 start_p = max(1, int(txt_start))
                 end_p = min(total_pages, int(txt_end))
+                
+                # הוספת תגית קובץ
+                abs_path = os.path.abspath(f_path)
+                full_text_accumulator += f"\n[FILE:{abs_path}]\n"
 
                 for i in range(start_p - 1, end_p):
                     page_num = i + 1
                     full_text_accumulator += f"\n\n[PAGE:{page_num}]\n"
-
                     page_text = doc[i].get_text()
-
+                    
                     if page_text:
-                        # === שלב 1: ניקוי שורות זבל ===
+                        # לוגיקת ניקוי (זהה ל-Advanced Import)
                         lines = page_text.split('\n')
+                        total_lines = len(lines)
                         cleaned_lines = []
-                        for line in lines:
+                        for line_idx, line in enumerate(lines):
                             stripped = line.strip()
+                            if len(stripped) == 0: continue
+                            # סינון מספרי עמודים: מספר בודד שמוקף בשורות ריקות
                             if re.match(r'^\s*\d+\s*$', stripped):
-                                continue
-                            if len(stripped) < 2 and stripped not in ['.', '!', '?', ',', ')', '(']:
-                                continue
+                                prev_empty = (line_idx == 0) or not lines[line_idx - 1].strip()
+                                next_empty = (line_idx >= total_lines - 1) or not lines[line_idx + 1].strip()
+                                if prev_empty or next_empty:
+                                    continue
+                            # שורות קצרות (תו אחד): לשמור רק אם הן פיסוק, אות או ספרה
+                            if len(stripped) == 1 and not re.match(r'[.!?,;:)(a-zA-Z0-9\u0590-\u05FF]', stripped): continue
                             cleaned_lines.append(stripped)
 
-                        # === שלב 1.5: תיקון סימני פיסוק RTL ===
-                        # ב-PDF עברי, PyMuPDF מחזיר לפעמים ".פינוייה" במקום "פינוייה."
-                        # כלומר סימן הפיסוק מופיע בתחילת השורה דבוק למילה הראשונה
-                        # התיקון מעביר את הסימן לסוף המילה שדבוקה אליו
                         for k in range(len(cleaned_lines)):
                             cleaned_lines[k] = re.sub(r'^([.!?,;:"\u05F4]+)(\S+)', r'\2\1', cleaned_lines[k])
-                        # תיקון סדר גרשיים-נקודה: word." -> word". (בעברית הגרשיים סוגרות לפני הנקודה)
                         for k in range(len(cleaned_lines)):
                             cleaned_lines[k] = re.sub(r'\.(")', r'\1.', cleaned_lines[k])
 
-                        # === שלב 1.6: איחוד שורות פיסוק/סוגריים בודדות לשורה הקודמת ===
                         merged_lines = []
                         for line in cleaned_lines:
                             if merged_lines and re.match(r'^[.!?,;:)(–\-\]\[]+$', line):
@@ -284,55 +286,37 @@ class MainEditTab(QWidget):
                                 merged_lines.append(line)
                         cleaned_lines = merged_lines
 
-                        # === שלב 2: איחוד פסקאות חכם ===
                         smart_text = ""
                         for j, line in enumerate(cleaned_lines):
-                            # אם השורה מתחילה בסימן פיסוק - אל תוסיף רווח לפניה
                             if j > 0:
                                 prev_line = cleaned_lines[j-1]
                                 current_starts_with_punct = line and line[0] in '.!?,;:'
-                                
-                                if current_starts_with_punct:
-                                    # אל תוסיף רווח - הנקודה תידבק למילה הקודמת
-                                    pass
-                                elif prev_line.endswith(('.', '!', '?', ':', ';', '"')):
-                                    smart_text += "\n"
-                                else:
-                                    smart_text += " "
-                            
+                                if current_starts_with_punct: pass
+                                elif prev_line.endswith(('.', '!', '?', ':', ';', '"')): smart_text += "\n"
+                                else: smart_text += " "
                             smart_text += line
 
-                        full_text_accumulator += smart_text
+                        # === פוליש סופי לעמוד זה ===
+                        smart_text = advanced_cleanup(smart_text)
+                        smart_text = re.sub(r'\.([^\s\n\d])', r'. \1', smart_text)
+                        smart_text = re.sub(r',([^\s\n])', r', \1', smart_text)
+                        smart_text = re.sub(r' {2,}', ' ', smart_text)
+                        smart_text = re.sub(r'\s+([.,!?;:])', r'\1', smart_text)
+                        smart_text = re.sub(r'\(\s+', '(', smart_text)
+                        smart_text = re.sub(r'\s+\)', ')', smart_text)
 
+                        full_text_accumulator += smart_text
+                
                 doc.close()
                 self.main_window.progress_bar.setValue(int(((idx + 1) / total_files) * 100))
-
-            # === שלב 3: פוליש סופי ===
-            final_text = advanced_cleanup(full_text_accumulator)
             
-            # תיקון: נקודה דבוקה למילה עברית - הוסף רווח אחרי הנקודה
-            # דוגמה: "פינוייה.כלומר" → "פינוייה. כלומר"
-            final_text = re.sub(r'\.([^\s\n])', r'. \1', final_text)
-            
-            # תיקון: פסיק דבוק למילה - הוסף רווח אחרי
-            final_text = re.sub(r',([^\s\n])', r', \1', final_text)
-            
-            # תיקון: רווחים מרובים
-            final_text = re.sub(r' {2,}', ' ', final_text)
-            
-            # תיקון: רווחים לפני סימני פיסוק
-            final_text = re.sub(r'\s+([.,!?;:])', r'\1', final_text)
-
-            # תיקון: רווחים מיותרים בתוך סוגריים
-            final_text = re.sub(r'\(\s+', '(', final_text)
-            final_text = re.sub(r'\s+\)', ')', final_text)
-
-            self.editor.setPlainText(final_text.strip())
+            # אין צורך בפוליש נוסף שמסכן את התגיות
+            self.editor.setPlainText(full_text_accumulator.strip())
             self.main_window.lbl_status.setText("הייבוא הושלם! (טקסט עבר סידור וניקוי)")
-
+            
             if hasattr(self, 'sync_pdf_to_cursor'):
                 self.sync_pdf_to_cursor()
-
+                
         except Exception as e:
             QMessageBox.critical(self, "שגיאה בייבוא", f"תקלה בחילוץ: {str(e)}")
             import traceback
@@ -343,13 +327,11 @@ class MainEditTab(QWidget):
         if not text.strip():
             QMessageBox.warning(self, "שגיאה", "אין טקסט לייצוא.")
             return
-
+            
         out_dir = os.path.dirname(self.file_path) if self.file_path else os.path.expanduser("~/Documents")
         file_name = self.input_filename.text().strip()
-        if not file_name:
-            file_name = f"Audio_{datetime.now().strftime('%H-%M')}"
+        if not file_name: file_name = f"Audio_{datetime.now().strftime('%H-%M')}"
         if not file_name.endswith(".mp3"): file_name += ".mp3"
-        
         save_path = os.path.join(out_dir, file_name)
         
         self.btn_convert.setEnabled(False)
@@ -359,45 +341,75 @@ class MainEditTab(QWidget):
         voice_name = self.combo_he.currentText()
         voice_key = self.he_voices.get(voice_name, "he-IL-HilaNeural")
         rate = self.combo_speed.currentText()
-
-        # Access settings via main_window
         current_dict = self.main_window.settings.get("nikud_dictionary", {})
+        
+        # === התיקון: ניקוי תגיות לפני שליחה ל-TTS ===
+        text_for_tts = self.clean_tags_for_tts(text)
+        # ============================================
 
-        self.tts_worker = TTSWorker(
-            text=text,
-            output_file=save_path,
-            voice=voice_key,
-            rate=rate,
-            volume="+0%",
-            dicta_dict=current_dict,
-            parent=self.main_window
-        )
+        # שמירת הקול האנגלי בהגדרות כדי שה-Worker ישתמש בו
+        self.main_window.settings["selected_en_voice"] = self.combo_en.currentText()
 
+        dual_mode = self.chk_dual.isChecked()
+        self.tts_worker = TTSWorker(text_for_tts, save_path, voice_key, rate, "+0%", current_dict, parent=self.main_window, dual_mode=dual_mode)
         self.tts_worker.finished_success.connect(self.on_tts_finished)
         self.tts_worker.progress_update.connect(self.main_window.progress_bar.setValue)
         self.tts_worker.error.connect(self.on_tts_error)
         self.tts_worker.start()
 
     def on_tts_finished(self, mp3_path, skipped, is_batch=False):
-        # ... (Copy logic from original, adapt self.tab_karaoke access)
         print(f"Finished: {mp3_path}")
-        self.btn_convert.setEnabled(True)
-        self.btn_convert.setText("🚀 צור קובץ MP3")
+        if not is_batch:
+            self.btn_convert.setEnabled(True)
+            self.btn_convert.setText("🚀 צור קובץ MP3")
         
-        # Load in Karaoke (Accessing sibling tab via main_window)
+        # רענון רשימת הפרויקטים בצד
+        if hasattr(self.main_window, 'tab_karaoke'):
+            try:
+                self.main_window.tab_karaoke.refresh_file_list()
+            except Exception as e:
+                print(f"[ERROR] Failed to refresh sidebar: {e}")
+
+        # טעינת הפרויקט לנגן (אם זה לא Batch)
         json_path = mp3_path.replace(".mp3", ".json")
         if os.path.exists(json_path) and hasattr(self.main_window, 'tab_karaoke'):
             self.main_window.tab_karaoke.load_project(json_path, mp3_path)
-            self.main_window.tabs.setCurrentWidget(self.main_window.tab_karaoke)
-
-        # Handle Telegram upload here if needed (using main_window settings)
+            if not is_batch:
+                self.main_window.tabs.setCurrentWidget(self.main_window.tab_karaoke)
+        
+        # === החלק החדש: שליחה לטלגרם עם PDF ===
         token = self.main_window.settings.get("tg_token", "")
         chat_id = self.main_window.settings.get("tg_chat_id", "")
         
         if token and chat_id:
-             self.tg_worker = TelegramWorker(token, chat_id, [(mp3_path, 'audio')])
-             self.tg_worker.finished.connect(self.on_telegram_upload_complete)
-             self.tg_worker.start()
+            files_to_send = [(mp3_path, 'audio')]
+            
+            # ניסיון ליצור ולצרף את ה-PDF הרלוונטי
+            try:
+                # 1. זיהוי הטקסט הרלוונטי (האם זה פיצול או מלא?)
+                relevant_text = ""
+                if is_batch and hasattr(self, 'current_batch_task') and self.current_batch_task:
+                    relevant_text = self.current_batch_task['text']
+                else:
+                    relevant_text = self.editor.toPlainText()
+                
+                # 2. חילוץ טווח העמודים מתוך הטקסט
+                min_page, max_page = self.extract_pages_from_text(relevant_text)
+                
+                # 3. יצירת קובץ PDF זמני
+                pdf_output_name = mp3_path.replace(".mp3", ".pdf")
+                created_pdf = self.create_sliced_pdf(pdf_output_name, min_page, max_page)
+                
+                if created_pdf and os.path.exists(created_pdf):
+                    files_to_send.append((created_pdf, 'document'))
+                    
+            except Exception as e:
+                print(f"[TG-PDF] Failed to attach PDF: {e}")
+
+            # שליחה
+            self.tg_worker = TelegramWorker(token, chat_id, files_to_send)
+            self.tg_worker.finished.connect(self.on_telegram_upload_complete)
+            self.tg_worker.start()
 
     def on_tts_error(self, msg):
         self.btn_convert.setEnabled(True)
@@ -407,40 +419,68 @@ class MainEditTab(QWidget):
     def on_telegram_upload_complete(self):
         self.main_window.lbl_status.setText("נשלח לטלגרם!")
 
-    # --- Nikud Logic ---
+    # ============================================
+    # === פונקציות הניקוד עם הגנת תגיות ===
+    # ============================================
+
+    def mask_tags(self, text):
+        """מחליפה תגיות קובץ/עמוד/תמונה בפלייסהולדרים מוגנים"""
+        placeholders = {}
+        
+        def replace_callback(match):
+            key = f"__PROTECTED_TAG_{len(placeholders)}__"
+            placeholders[key] = match.group(0)
+            return key
+
+        # תבנית שתופסת את כל התגיות הרגישות
+        pattern = r'(\[(?:FILE|PAGE|IMG):.*?\])'
+        masked_text = re.sub(pattern, replace_callback, text)
+        return masked_text, placeholders
+
+    def unmask_tags(self, text, placeholders):
+        """מחזירה את התגיות המקוריות במקום הפלייסהולדרים"""
+        result = text
+        for key, val in placeholders.items():
+            result = result.replace(key, val)
+        return result
+
     def start_auto_nikud(self):
         self.stop_worker_safely('nikud_worker')
         text = self.get_text_safe()
         if not text.strip(): return
         
+        # 1. הסוואה (Masking)
+        masked_text, self.active_placeholders = self.mask_tags(text)
+        
         self.btn_nikud_auto.setText("מנקד...")
         self.btn_nikud_auto.setEnabled(False)
         
         current_dict = self.main_window.settings.get("nikud_dictionary", {})
-        self.nikud_worker = NikudWorker(text, current_dict)
+        
+        self.nikud_worker = NikudWorker(masked_text, current_dict)
         self.nikud_worker.finished.connect(self.on_nikud_success)
         self.nikud_worker.error.connect(self.on_nikud_error)
         self.nikud_worker.start()
 
-    def on_nikud_success(self, vocalized_text):
-        # שחזור מצב הכפתורים
+    def on_nikud_success(self, vocalized_masked_text):
         self.btn_nikud_auto.setEnabled(True)
         self.btn_nikud_auto.setText("✨ ניקוד אוטומטי (Dicta)")
         self.main_window.progress_bar.setValue(100)
         
-        # 1. שליפת הטקסט המקורי בצורה בטוחה (כולל תגיות תמונה) לצורך השוואה
+        # 2. חשיפת התגיות (Unmasking)
+        vocalized_text = self.unmask_tags(vocalized_masked_text, self.active_placeholders)
+        self.active_placeholders = {} # ניקוי
+
         original_text = self.get_text_safe()
 
-        # בדיקת זהות מוחלטת (אם אין שום שינוי, חבל להריץ לוגיקה כבדה)
         if original_text == vocalized_text:
             self.main_window.lbl_status.setText("הניקוד הסתיים. לא נמצאו שינויים.")
-            self.set_text_safe(vocalized_text) # משחזר את התמונות
+            self.set_text_safe(vocalized_text) 
             return
 
         self.main_window.lbl_status.setText("הניקוד הסתיים! אנא אשר שינויים.")
 
-        # === לוגיקת השוואה (Diff) ===
-        # פונקציה לפירוק למילים ששומרת על תגיות תמונה שלמות כדי לא לשבור אותן
+        # לוגיקת השוואה
         def tokenize(txt):
             return re.findall(r'\[IMG:.*?\]|[\u0590-\u05FF]+|[^\s\u0590-\u05FF]+', txt)
 
@@ -450,268 +490,45 @@ class MainEditTab(QWidget):
         changes_map = {} 
         all_orig_words = []
         
-        # שימוש ב-difflib למציאת ההבדלים בין הטקסט הישן לחדש
         matcher = difflib.SequenceMatcher(None, orig_tokens, new_tokens)
         
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag == 'replace':
                 segment_orig = orig_tokens[i1:i2]
                 segment_new = new_tokens[j1:j2]
-                
-                # ניסיון התאמה 1-על-1 במקרה של החלפה
                 for k in range(min(len(segment_orig), len(segment_new))):
                     o_word = segment_orig[k]
                     n_word = segment_new[k]
-                    
-                    # מתייחסים רק למילים בעברית (ולא לתמונות או סימנים)
                     if any('א' <= c <= 'ת' for c in o_word) and "[IMG:" not in o_word:
                         all_orig_words.append(o_word)
                         if o_word != n_word:
                             changes_map[o_word] = n_word
-            
             elif tag == 'equal':
-                # גם במילים זהות, צריך לספור אותן לסטטיסטיקה
                 for k in range(i1, i2):
                     w = orig_tokens[k]
                     if any('א' <= c <= 'ת' for c in w) and "[IMG:" not in w:
                         all_orig_words.append(w)
 
-        # יצירת הרשימה הסופית לדיאלוג
         word_counts = Counter(all_orig_words)
         final_list = []
-        
         for orig, new in changes_map.items():
             count = word_counts[orig]
             final_list.append((orig, new, count))
-        
-        # מיון: מילים נפוצות למעלה
         final_list.sort(key=lambda x: x[2], reverse=True)
 
-        # === שלב ההכרעה: דיאלוג או עדכון ישיר ===
         if final_list:
-            # אם יש שינויים, פותחים את הדיאלוג
             dialog = AnalysisDialog(final_list, self)
             dialog.pending_text = vocalized_text 
             dialog.exec_()
         else:
-            # אם אין שינויים (או שרק סימני פיסוק השתנו), מעדכנים ישירות
             self.main_window.lbl_status.setText("לא נמצאו שינויים מהותיים במילים.")
-            # === הפקודה החשובה ביותר: עדכון בטוח ששומר על התמונות ===
             self.set_text_safe(vocalized_text)
-
-    def on_nikud_error(self, msg):
-        self.btn_nikud_auto.setEnabled(True)
-        self.btn_nikud_auto.setText("✨ הוסף ניקוד אוטומטי (Dicta)")
-        self.main_window.lbl_status.setText("שגיאה בניקוד")
-        QMessageBox.warning(self, "שגיאה", msg)
-
-    # --- Text Tools ---
-    def set_text_direction(self, direction):
-        self.editor.setLayoutDirection(direction); 
-        cursor = self.editor.textCursor(); 
-        block_format = cursor.blockFormat(); 
-        block_format.setLayoutDirection(direction); 
-        cursor.setBlockFormat(block_format); 
-        self.editor.setTextCursor(cursor); 
-        self.editor.setFocus()
-        
-
-    def search_text(self):
-        """מבצע חיפוש בתוך עורך הטקסט"""
-        search_str = self.input_search.text()
-        if not search_str:
-            return
-            
-        # שימוש בפונקציית החיפוש המובנית של QTextEdit
-        found = self.editor.find(search_str)
-        
-        if not found:
-            # אם לא נמצא, ננסה לחפש שוב מתחילת המסמך (Loop)
-            cursor = self.editor.textCursor()
-            cursor.movePosition(QTextCursor.Start)
-            self.editor.setTextCursor(cursor)
-            
-            # חיפוש נוסף מההתחלה
-            found = self.editor.find(search_str)
-            
-            if not found:
-                self.main_window.lbl_status.setText(f"❌ הביטוי '{search_str}' לא נמצא.")
-            else:
-                self.main_window.lbl_status.setText(f"🔍 נמצא: '{search_str}' (חיפוש מההתחלה)")
-        else:
-             self.main_window.lbl_status.setText(f"🔍 נמצא: '{search_str}'")
-
-    def update_char_count(self):
-        """מעדכן את מספר התווים בשורת הסטטוס"""
-        text = self.editor.toPlainText()
-        count = len(text)
-        # מעדכן את הסטטוס בר (למשל: "תווים: 120")
-        self.main_window.lbl_status.setText(f"תווים: {count}")
-
-    def sync_pdf_to_cursor(self):
-        """
-        פונקציית סנכרון: מזהה את המיקום הנוכחי בעורך הטקסט,
-        מוצאת את תגית העמוד האחרונה ([PAGE:X]) ומעדכנת את ה-PDF משמאל.
-        """
-        try:
-            # אם אין צפיין PDF פעיל, אין מה לסנכרן
-            if not hasattr(self, 'pdf_viewer'):
-                return
-
-            # 1. קבלת מיקום הסמן הנוכחי
-            cursor = self.editor.textCursor()
-            position = cursor.position()
-
-            # 2. שליפת הטקסט מתחילת המסמך ועד למיקום הסמן
-            # כך אנו מבטיחים שנמצא את התגית ששולטת על הקטע הנוכחי
-            text_up_to_cursor = self.editor.toPlainText()[:position]
-
-            # 3. חיפוש כל תגיות העמוד בקטע הטקסט הזה
-            # מחפש תבנית כמו [PAGE:12] או [PAGE:5]
-            matches = re.findall(r'\[PAGE:(\d+)\]', text_up_to_cursor)
-
-            if matches:
-                # 4. לוקחים את התוצאה האחרונה ברשימה
-                # (האחרונה היא זו שהכי קרובה למיקום הסמן שלנו מלמעלה)
-                last_page_str = matches[-1]
-                target_page = int(last_page_str)
-
-                # 5. עדכון הצפיין (רק אם העמוד באמת השתנה)
-                # בדיקה זו מונעת ריצודים וטעינות חוזרות מיותרות
-                if self.pdf_viewer.current_page != target_page:
-                    print(f"[SYNC] Cursor at pos {position} -> Jump to PDF Page {target_page}")
-                    self.pdf_viewer.show_page(target_page)
-            
-            else:
-                # אם לא נמצאה שום תגית (למשל בתחילת המסמך), נלך לעמוד 1 או לעמוד ההתחלה שהוגדר
-                start_page = 1
-                if self.input_start.text().strip().isdigit():
-                    start_page = int(self.input_start.text())
-                
-                if self.pdf_viewer.current_page != start_page:
-                    self.pdf_viewer.show_page(start_page)
-
-        except Exception as e:
-            # תופסים שגיאות כדי לא לתקוע את התוכנה בזמן הקלדה
-            print(f"[SYNC ERROR] Could not sync PDF: {e}")   
-
-    # --- Safe Text (Images) ---
-    def get_text_safe(self):
-        """
-        שואב את הטקסט מהעורך, וממיר את התמונות הוויזואליות 
-        בחזרה לתגיות טקסט [IMG:path] כדי שהמנוע יוכל לעבוד איתן.
-        """
-        doc = self.editor.document()
-        full_text = ""
-        
-        block = doc.begin()
-        while block.isValid():
-            iter_ = block.begin()
-            # אם הבלוק ריק (רק ירידת שורה), נוסיף ירידת שורה
-            if iter_.atEnd():
-                full_text += "\n"
-            
-            while not iter_.atEnd():
-                fragment = iter_.fragment()
-                if fragment.isValid():
-                    char_format = fragment.charFormat()
-                    # בדיקה: האם זו תמונה?
-                    if char_format.isImageFormat():
-                        img_fmt = char_format.toImageFormat()
-                        name = img_fmt.name()
-                        # המרה לתגית טקסט עבור המנוע
-                        full_text += f"\n[IMG:{name}]\n"
-                    else:
-                        # סתם טקסט
-                        full_text += fragment.text()
-                iter_ += 1
-            
-            # סוף בלוק = בדרך כלל ירידת שורה, אלא אם כן זו תמונה שכבר הוספנו לה
-            if not full_text.endswith("\n") and not full_text.endswith("]\n"):
-                 full_text += "\n"
-                 
-            block = block.next()
-            
-        return full_text.strip()
-
-    def set_text_safe(self, text_with_tags):
-        """
-        לוקח טקסט עם תגיות [IMG:path] ומציג אותן כתמונות אמיתיות בעורך.
-        """
-        print(f"[DEBUG] set_text_safe called. Length: {len(text_with_tags)}")
-        
-        self.editor.clear()
-        cursor = self.editor.textCursor()
-        
-        # איפוס פורמטים למניעת גלישת סגנונות
-        cursor.setBlockFormat(QTextBlockFormat())
-        cursor.setCharFormat(QTextCharFormat())
-
-        # פיצול חכם: מפריד בין טקסט רגיל לתגיות תמונה
-        parts = re.split(r'(\[IMG:.*?\])', text_with_tags)
-        
-        images_count = 0
-        
-        for part in parts:
-            if part.startswith("[IMG:") and part.endswith("]"):
-                # === זו תמונה! ===
-                path = part[5:-1] # חילוץ הנתיב נטו
-                
-                print(f"[DEBUG] Found Image Tag: {path}")
-                
-                if os.path.exists(path):
-                    cursor.insertBlock() # שורה חדשה לפני
-                    
-                    img_fmt = QTextImageFormat()
-                    img_fmt.setName(path)
-                    
-                    # קביעת רוחב מקסימלי כדי שלא ישבור את המסך
-                    img_fmt.setWidth(550) 
-                    
-                    cursor.insertImage(img_fmt)
-                    cursor.insertBlock() # שורה חדשה אחרי
-                    images_count += 1
-                else:
-                    print(f"[ERROR] Image path does not exist: {path}")
-                    cursor.insertText(f"[תמונה חסרה: {os.path.basename(path)}]")
-                
-            else:
-                # === זה טקסט רגיל ===
-                if part:
-                    cursor.insertText(part)
-        
-        print(f"[DEBUG] set_text_safe finished. Inserted {images_count} images.")
-        self.editor.moveCursor(QTextCursor.Start)
-
-    # --- Helpers ---
-    def stop_worker_safely(self, worker_attr_name):
-        """פונקציית עזר לעצירה בטוחה של תהליכונים למניעת קריסות"""
-        if hasattr(self, worker_attr_name):
-            worker = getattr(self, worker_attr_name)
-            if worker and worker.isRunning():
-                print(f"[DEBUG] Stopping active worker: {worker_attr_name}")
-                worker.quit()
-                worker.wait(2000) # מחכים עד 2 שניות לסיום מסודר
-                if worker.isRunning(): # אם עדיין רץ - עצירה כפויה (למניעת קריסה)
-                    worker.terminate()
-                    worker.wait()
-
-    def open_advanced_import(self):
-        dialog = AdvancedImportDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            # כשהמשתמש לוחץ "בצע ייבוא", הטקסט מגיע לכאן
-            if dialog.result_text:
-                self.editor.setPlainText(dialog.result_text)
-                self.main_window.lbl_status.setText("הייבוא המתקדם הושלם בהצלחה!")
-            else:
-                self.main_window.lbl_status.setText("הייבוא הסתיים ללא טקסט.")
 
     def run_dictionary_only(self):
         """
         עובר על הטקסט ומחליף רק מילים שקיימות במילון האישי.
-        כל שאר הטקסט נשאר ללא ניקוד/שינוי.
+        גרסה מוגנת לתגיות.
         """
-        # 1. בדיקה שיש מילון
         current_dict = self.main_window.settings.get("nikud_dictionary", {})
         metadata = self.main_window.settings.get("nikud_metadata", {})
         
@@ -722,71 +539,226 @@ class MainEditTab(QWidget):
         self.main_window.lbl_status.setText("מחיל ניקוד לפי מילון בלבד...")
         QApplication.processEvents()
 
-        # 2. שליפת הטקסט הבטוח (שומר על תגיות תמונה)
         text = self.get_text_safe()
         
-        # 3. מיון המילון לפי אורך מילה (מהארוך לקצר)
-        # זה קריטי כדי שלא נחליף בטעות חלק ממילה (למשל 'בצל' בתוך 'בצלם')
-        sorted_keys = sorted(current_dict.keys(), key=len, reverse=True)
+        # 1. הסוואה
+        masked_text, placeholders = self.mask_tags(text)
         
-        processed_text = text
+        sorted_keys = sorted(current_dict.keys(), key=len, reverse=True)
+        processed_text = masked_text
         count = 0
 
-        # 4. ביצוע ההחלפות
         for base_word in sorted_keys:
             target_word = current_dict[base_word]
-            
-            # בדיקה אם צריך התאמה מדויקת או חלקית
             is_exact = False
             if base_word in metadata:
                  if metadata[base_word].get('match_type') == 'exact':
                      is_exact = True
-            
-            # אם הערך במילון זהה למילה בטקסט (בלי ניקוד), אין טעם להחליף סתם
-            # אבל אנחנו מניחים שהערך במילון מנוקד.
 
             if is_exact:
-                # החלפה רק אם זו מילה שלמה (גבולות מילה)
-                # (?<!...) מוודא שאין אות עברית/אנגלית לפני
-                # (?!...) מוודא שאין אות עברית/אנגלית אחרי
                 pattern = r'(?<![\w\u0590-\u05FF])' + re.escape(base_word) + r'(?![\w\u0590-\u05FF])'
                 processed_text, n = re.subn(pattern, target_word, processed_text)
                 count += n
             else:
-                # החלפה חלקית (פשוטה)
                 if base_word in processed_text:
-                    # שימוש ב-replace רגיל במקום regex לביצועים, אבל regex בטוח יותר למניעת לולאות
-                    # נשתמש ב-regex פשוט להחלפה גלובלית
                     pattern = re.escape(base_word)
                     processed_text, n = re.subn(pattern, target_word, processed_text)
                     count += n
 
-        # 5. החזרת הטקסט לעורך
+        # 2. חשיפה
+        final_text = self.unmask_tags(processed_text, placeholders)
+
         if count > 0:
-            self.set_text_safe(processed_text)
+            self.set_text_safe(final_text)
             self.main_window.lbl_status.setText(f"בוצע! הוחלפו {count} מופעים מתוך המילון.")
             QMessageBox.information(self, "סיום", f"התהליך הסתיים.\nבוצעו {count} החלפות לפי המילון.")
         else:
             self.main_window.lbl_status.setText("לא נמצאו מילים מהמילון בטקסט.")
             QMessageBox.information(self, "סיום", "לא נמצאו בטקסט מילים שמופיעות במילון שלך.")
 
-         
-    def open_split_dialog(self):
-        """פותח את חלון ההגדרות לפיצול"""
-        # לוקח את שם הקובץ הנוכחי כברירת מחדל
-        current_name = self.input_filename.text()
+    def on_nikud_error(self, msg):
+        self.btn_nikud_auto.setEnabled(True)
+        self.btn_nikud_auto.setText("✨ הוסף ניקוד אוטומטי (Dicta)")
+        self.main_window.lbl_status.setText("שגיאה בניקוד")
+        QMessageBox.warning(self, "שגיאה", msg)
+
+    def set_text_direction(self, direction):
+        self.editor.setLayoutDirection(direction)
+        cursor = self.editor.textCursor()
+        block_format = cursor.blockFormat()
+        block_format.setLayoutDirection(direction)
+        cursor.setBlockFormat(block_format)
+        self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+
+    def search_text(self):
+        search_str = self.input_search.text()
+        if not search_str: return
+        found = self.editor.find(search_str)
+        if not found:
+            cursor = self.editor.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            self.editor.setTextCursor(cursor)
+            found = self.editor.find(search_str)
+            if not found:
+                self.main_window.lbl_status.setText(f"❌ הביטוי '{search_str}' לא נמצא.")
+            else:
+                self.main_window.lbl_status.setText(f"🔍 נמצא: '{search_str}' (חיפוש מההתחלה)")
+        else:
+             self.main_window.lbl_status.setText(f"🔍 נמצא: '{search_str}'")
+
+    def update_char_count(self):
+        text = self.editor.toPlainText()
+        count = len(text)
+        self.main_window.lbl_status.setText(f"תווים: {count}")
+
+    def sync_pdf_to_cursor(self):
+        try:
+            if not hasattr(self, 'pdf_viewer'): return
+            cursor = self.editor.textCursor()
+            position = cursor.position()
+            start_pos = max(0, position - 3000)
+            text_chunk = self.editor.toPlainText()[start_pos:position]
+            
+            # --- זיהוי קובץ ---
+            file_matches = re.findall(r'\[FILE:(.*?)\]', text_chunk)
+            if file_matches:
+                raw_path = file_matches[-1]
+                # ניקוי לכלוך (RTL) ותיקון רווחים
+                clean_path = raw_path.replace('\u200e', '').replace('\u200f', '').replace('\u202a', '').replace('\u202c', '').strip()
+                clean_path = clean_path.replace('. pdf', '.pdf')
+                
+                current_loaded = os.path.normpath(self.file_path) if self.file_path else ""
+                
+                # נרמול למק (NFC/NFD)
+                target_candidates = [
+                    os.path.normpath(clean_path),
+                    unicodedata.normalize('NFC', clean_path),
+                    unicodedata.normalize('NFD', clean_path)
+                ]
+                
+                found_path = None
+                for candidate in target_candidates:
+                    if os.path.exists(candidate):
+                        found_path = candidate
+                        break
+                        
+                if found_path and current_loaded != os.path.normpath(found_path):
+                    print(f"[SYNC] Switching PDF to: {found_path}")
+                    self.file_path = found_path
+                    self.pdf_viewer.load_pdf(found_path)
+                    self.lbl_file.setText(os.path.basename(found_path))
+                    if found_path not in self.file_paths:
+                        self.file_paths.append(found_path)
+            
+            # --- זיהוי עמוד ---
+            page_matches = re.findall(r'\[PAGE:(\d+)\]', text_chunk)
+            if page_matches:
+                target_page = int(page_matches[-1])
+                if self.pdf_viewer.current_page != target_page:
+                    self.pdf_viewer.show_page(target_page)
+            elif not page_matches and not file_matches:
+                start_page = 1
+                if self.input_start.text().strip().isdigit():
+                    start_page = int(self.input_start.text())
+                if self.pdf_viewer.current_page != start_page:
+                    self.pdf_viewer.show_page(start_page)
+        except Exception as e:
+            print(f"[SYNC ERROR]: {e}")
+
+    def get_text_safe(self):
+        doc = self.editor.document()
+        full_text = ""
+        block = doc.begin()
+        while block.isValid():
+            iter_ = block.begin()
+            if iter_.atEnd(): full_text += "\n"
+            while not iter_.atEnd():
+                fragment = iter_.fragment()
+                if fragment.isValid():
+                    char_format = fragment.charFormat()
+                    if char_format.isImageFormat():
+                        img_fmt = char_format.toImageFormat()
+                        name = img_fmt.name()
+                        full_text += f"\n[IMG:{name}]\n"
+                    else:
+                        full_text += fragment.text()
+                iter_ += 1
+            if not full_text.endswith("\n") and not full_text.endswith("]\n"):
+                 full_text += "\n"
+            block = block.next()
+        return full_text.strip()
+
+    def set_text_safe(self, text_with_tags):
+        print(f"[DEBUG] set_text_safe called. Length: {len(text_with_tags)}")
+        self.editor.clear()
+        cursor = self.editor.textCursor()
+        cursor.setBlockFormat(QTextBlockFormat())
+        cursor.setCharFormat(QTextCharFormat())
         
+        parts = re.split(r'(\[IMG:.*?\])', text_with_tags)
+        
+        for part in parts:
+            if part.startswith("[IMG:") and part.endswith("]"):
+                path = part[5:-1]
+                if os.path.exists(path):
+                    cursor.insertBlock()
+                    img_fmt = QTextImageFormat()
+                    img_fmt.setName(path)
+                    img_fmt.setWidth(550) 
+                    cursor.insertImage(img_fmt)
+                    cursor.insertBlock()
+                else:
+                    cursor.insertText(f"[תמונה חסרה: {os.path.basename(path)}]")
+            else:
+                if part: cursor.insertText(part)
+                
+        self.editor.moveCursor(QTextCursor.Start)
+
+    def stop_worker_safely(self, worker_attr_name):
+        if hasattr(self, worker_attr_name):
+            worker = getattr(self, worker_attr_name)
+            if worker and worker.isRunning():
+                worker.quit()
+                worker.wait(2000)
+                if worker.isRunning():
+                    worker.terminate()
+                    worker.wait()
+
+    def open_advanced_import(self):
+        start_dir = ""
+        # קביעת תיקייה חכמה
+        if self.file_path: start_dir = os.path.dirname(self.file_path)
+        elif self.file_paths: start_dir = os.path.dirname(self.file_paths[0])
+        
+        dialog = AdvancedImportDialog(start_dir, self) 
+        
+        if dialog.exec_() == QDialog.Accepted:
+            if dialog.result_text:
+                self.editor.setPlainText(dialog.result_text)
+                self.main_window.lbl_status.setText("הייבוא המתקדם הושלם בהצלחה!")
+                
+                imported_files = getattr(dialog, 'files_list', [])
+                if imported_files and len(imported_files) > 0:
+                    self.file_paths = imported_files
+                    self.file_path = imported_files[0]
+                    if hasattr(self, 'pdf_viewer'):
+                        self.pdf_viewer.load_pdf(self.file_path)
+                    self.lbl_file.setText(os.path.basename(self.file_path))
+                    self.sync_pdf_to_cursor()
+            else:
+                self.main_window.lbl_status.setText("הייבוא הסתיים ללא טקסט.")
+
+    def open_split_dialog(self):
+        current_name = self.input_filename.text()
         dialog = SplitExportDialog(current_name, self)
         if dialog.exec_() == QDialog.Accepted:
             data = dialog.get_data()
-            # קריאה לפונקציית העיבוד עם הנתונים מהדיאלוג
             self.start_split_export_process(data)
          
     def start_split_export_process(self, data):
-        """מתחיל תהליך של פיצול הטקסט וייצוא סדרתי (מקבל נתונים מהדיאלוג)"""
+        print("\n=== [DEBUG] Starting Split Process (Fixed Logic) ===")
         full_text = self.editor.toPlainText()
-        
-        # חילוץ הנתונים שהתקבלו מהדיאלוג
         split_word = data["split_word"]
         base_filename = data["filename"] or "Audio"
         use_number = data["use_number"]
@@ -794,154 +766,218 @@ class MainEditTab(QWidget):
         if not full_text.strip():
             QMessageBox.warning(self, "שגיאה", "העורך ריק.")
             return
-            
-        if not split_word:
-            QMessageBox.warning(self, "שגיאה", "לא הוזנה מילה לפיצול.")
-            return
 
-        # 1. לוגיקת החיתוך (Regex)
+        # 1. יצירת ה-Regex
         if use_number:
-            # מחפש: מילה + רווחים + ספרות (לדוגמה: "הרצאה 5")
             pattern = rf'(?={re.escape(split_word)}\s+\d+)'
         else:
-            # מחפש רק את המילה
             pattern = rf'(?={re.escape(split_word)})'
             
-        segments = re.split(pattern, full_text)
-        segments = [s.strip() for s in segments if s.strip()]
-        
-        if len(segments) < 2:
-            QMessageBox.warning(self, "שים לב", f"לא נמצאה המילה '{split_word}' (או שלא בוצע פיצול).")
-            return
+        # 2. פיצול
+        raw_segments = re.split(pattern, full_text)
+        segments = [s for s in raw_segments if s.strip()] # סינון סגמנטים ריקים לגמרי
 
-        # 2. בניית התור (Queue)
         self.batch_queue = []
         
-        # קביעת תיקיית יעד
+        # בחירת נתיב
         out_dir = ""
         if hasattr(self, 'file_paths') and self.file_paths:
             out_dir = os.path.dirname(self.file_paths[0])
         elif hasattr(self, 'file_path') and self.file_path:
             out_dir = os.path.dirname(self.file_path)
         if not out_dir: out_dir = os.path.expanduser("~/Documents")
+        
+        # === ניהול זיכרון (State Tracking) ===
+        
+        # קובץ התחלתי
+        last_seen_file_tag = None
+        if self.file_path:
+            abs_p = os.path.abspath(self.file_path)
+            last_seen_file_tag = f"[FILE:{abs_p}]"
 
-        print(f"[DEBUG] Splitting into {len(segments)} parts based on '{split_word}'")
+        # עמוד התחלתי (למשל 1, או מה שנקבע בתיבה למעלה)
+        current_tracker_page = "1"
+        if self.input_start.text().strip().isdigit():
+             current_tracker_page = self.input_start.text().strip()
 
-        for idx, segment_text in enumerate(segments):
-            clean_first_line = segment_text.split('\n')[0].strip()
-            safe_name_start = re.sub(r'[\\/*?:"<>|]', "", clean_first_line)
+        print(f"[DEBUG] Initial Page Tracker: {current_tracker_page}")
+
+        valid_counter = 0
+
+        for i, segment_text in enumerate(segments):
+            print(f"\n--- Processing Segment {i} ---")
             
-            # לוקחים רק את ה-3-4 מילים הראשונות לשם הקובץ
+            # === שלב קריטי 1: שמירת המצב הנוכחי לשימוש בסגמנט הזה ===
+            # זה העמוד שצריך להופיע בתחילת הקטע הנוכחי, לפני שמעדכנים אותו לפי מה שכתוב בפנים
+            start_page_for_this_segment = current_tracker_page
+            
+            # === שלב 2: סריקה ועדכון הזיכרון לעתיד (לסגמנט הבא) ===
+            
+            # עדכון קובץ
+            file_match = re.search(r'\[FILE:(.*?)\]', segment_text)
+            if file_match:
+                last_seen_file_tag = file_match.group(0)
+            
+            # עדכון עמוד: אם יש עמודים בתוך הטקסט, העמוד האחרון יהיה נקודת ההתחלה של הקטע הבא
+            page_matches = re.findall(r'\[PAGE:(\d+)\]', segment_text)
+            if page_matches:
+                current_tracker_page = page_matches[-1] # עדכון לשימוש עתידי
+                print(f"[DEBUG] Pages found inside text: {page_matches}. Next segment will start at: {current_tracker_page}")
+            else:
+                print(f"[DEBUG] No pages found inside. Next segment continues from: {current_tracker_page}")
+
+            # === שלב 3: בדיקה אם הסגמנט הוא "תוכן" או סתם תגיות ===
+            clean_content = re.sub(r'\[(?:FILE|PAGE|IMG):.*?\]', '', segment_text).strip()
+            
+            if not clean_content:
+                print(f"[DEBUG] Skipping empty segment. (Context updated: Page {start_page_for_this_segment} -> {current_tracker_page})")
+                continue
+
+            # === שלב 4: בניית הטקסט והזרקת התגיות ===
+            final_segment_text = segment_text
+            
+            # הזרקת תגית עמוד: משתמשים ב-start_page_for_this_segment (הישן) ולא ב-tracker המעודכן!
+            if not re.match(r'^\s*\[PAGE:', segment_text):
+                injected_page = f"[PAGE:{start_page_for_this_segment}]"
+                print(f"[DEBUG] Injecting start page: {injected_page}")
+                final_segment_text = f"{injected_page}\n{final_segment_text}"
+            
+            # הזרקת תגית קובץ
+            if not re.match(r'^\s*\[FILE:', segment_text) and last_seen_file_tag:
+                 final_segment_text = f"{last_seen_file_tag}\n{final_segment_text}"
+
+            # === שלב 5: שמירת הקובץ ===
+            clean_first_line = clean_content.split('\n')[0].strip()
+            safe_name_start = re.sub(r'[\\/*?:"<>|]', "", clean_first_line)
             name_words = safe_name_start.split()[:4]
             short_name = " ".join(name_words)
             
-            if idx == 0 and not clean_first_line.startswith(split_word):
+            if valid_counter == 0 and not clean_first_line.startswith(split_word):
                 final_name = f"{base_filename}_Start"
             else:
                 final_name = f"{base_filename}_{short_name}"
             
-            # מוודאים שאין רווחים מיותרים בשם הקובץ
             final_name = final_name.replace(" ", "_")
             full_path = os.path.join(out_dir, f"{final_name}.mp3")
             
             self.batch_queue.append({
-                "text": segment_text,
+                "text": final_segment_text,
                 "path": full_path,
-                "index": idx + 1,
-                "total": len(segments)
+                "index": valid_counter + 1,
+                "total": 0 
             })
+            valid_counter += 1
+            
+        # סיום
+        total_items = len(self.batch_queue)
+        for item in self.batch_queue:
+            item['total'] = total_items
 
-        self.total_batch_size = len(self.batch_queue)
-        self.run_next_batch_task()
-         
+        self.total_batch_size = total_items
+        
+        if self.total_batch_size > 0:
+            self.run_next_batch_task()
+        else:
+            QMessageBox.warning(self, "שגיאה", "לא נותר טקסט לייצוא לאחר הסינון.")
+
+
     def run_next_batch_task(self):
-        """לוקח את המשימה הבאה בתור ומריץ אותה"""
         if not hasattr(self, 'batch_queue') or not self.batch_queue:
             self.main_window.lbl_status.setText("✅ כל הקבצים בתור עובדו בהצלחה!")
             self.btn_convert.setEnabled(True)
             self.btn_split_export.setEnabled(True)
             self.main_window.progress_bar.setValue(100)
+            
+            # === רענון רשימת הפרויקטים בצד ===
+            if hasattr(self.main_window, 'tab_karaoke'):
+                try:
+                    self.main_window.tab_karaoke.refresh_file_list()
+                    print("[DEBUG] Project list refreshed successfully.")
+                except Exception as e:
+                    print(f"[ERROR] Failed to refresh project list: {e}")
+            # ==================================
+
             QMessageBox.information(self, "סיום", f"הסתיים עיבוד של {self.total_batch_size} קבצים.")
             return
-
-        # שליפת המשימה הבאה
+            
         task = self.batch_queue.pop(0)
-        
         self.current_batch_task = task
         self.main_window.lbl_status.setText(f"מעבד חלק {task['index']}/{task['total']}: {os.path.basename(task['path'])}...")
         self.main_window.progress_bar.setValue(0)
         
-        # נעילת כפתורים
         self.btn_convert.setEnabled(False)
         self.btn_split_export.setEnabled(False)
-
-        # הרצת ה-Worker (כמו בייצוא רגיל)
+        
         voice_key = "he-IL-HilaNeural"
         if hasattr(self, 'combo_he'):
             voice_name = self.combo_he.currentText()
             voice_key = self.he_voices.get(voice_name, "he-IL-HilaNeural")
+        
         rate = self.combo_speed.currentText()
         current_dict = self.main_window.settings.get("nikud_dictionary", {})
+        
+        # === התיקון: ניקוי תגיות לפני שליחה ל-TTS ===
+        text_for_tts = self.clean_tags_for_tts(task['text'])
+        # ============================================
 
-        self.tts_worker = TTSWorker(
-            text=task['text'],
-            output_file=task['path'],
-            voice=voice_key,
-            rate=rate,
-            volume="+0%",
-            dicta_dict=current_dict,
-            parent=self
-        )
-
-        # שים לב: אנחנו מחברים לפונקציה מיוחדת שיודעת להמשיך את התור
+        dual_mode = self.chk_dual.isChecked() if hasattr(self, 'chk_dual') else False
+        self.tts_worker = TTSWorker(text_for_tts, task['path'], voice_key, rate, "+0%", current_dict, parent=self, dual_mode=dual_mode)
         self.tts_worker.finished_success.connect(self.on_batch_part_finished)
         self.tts_worker.progress_update.connect(self.main_window.progress_bar.setValue)
-        self.tts_worker.error.connect(self.on_tts_error) # אפשר להוסיף טיפול שגיאות שממשיך הלאה
-        
+        self.tts_worker.error.connect(self.on_tts_error)
         self.tts_worker.start()
          
     def on_batch_part_finished(self, mp3_path, skipped):
-        """נקרא כשחלק אחד בתור מסתיים"""
         print(f"[DEBUG] Finished part: {mp3_path}")
-        
-        # 1. לוגיקה רגילה של סיום (יצירת PDF חתוך, טלגרם וכו')
-        # אנחנו קוראים לפונקציה המקורית כדי שתטפל בשמירה ובטלגרם עבור הקובץ הספציפי הזה
         self.on_tts_finished(mp3_path, skipped, is_batch=True)
-        
-        # 2. המשך לקובץ הבא בתור
-        # השהייה קטנה כדי לתת למערכת לנשום
         QTimer.singleShot(1000, self.run_next_batch_task)
+
+    def extract_pages_from_text(self, text):
+        """מחלץ את מספרי העמודים (מינימום ומקסימום) מתוך טקסט נתון"""
+        matches = re.findall(r'\[PAGE:(\d+)\]', text)
+        if matches:
+            pages = [int(p) for p in matches]
+            return min(pages), max(pages)
+        return None, None
          
-    def create_sliced_pdf(self, output_filename):
-        """יוצר קובץ PDF זמני הכולל רק את העמודים הנבחרים"""
+    def create_sliced_pdf(self, output_filename, start_page=None, end_page=None):
+        """
+        יוצר קובץ PDF הכולל רק את העמודים הרלוונטיים.
+        אם start_page/end_page לא מסופקים, משתמש בערכים מה-GUI.
+        """
         if not hasattr(self, 'file_path') or not self.file_path or not os.path.exists(self.file_path):
             return None
 
         try:
-            # שליפת טווח העמודים מהממשק
-            try:
-                start_page = int(self.input_start.text())
-                end_page = int(self.input_end.text())
-            except:
-                return None # אם הקלט לא תקין
+            # קביעת טווח העמודים (אם לא סופק, לוקחים מהממשק)
+            if start_page is None:
+                try:
+                    start_page = int(self.input_start.text())
+                except: start_page = 1
+            
+            if end_page is None:
+                try:
+                    end_page = int(self.input_end.text())
+                except: end_page = 1000
 
             reader = PyPDF2.PdfReader(self.file_path)
             writer = PyPDF2.PdfWriter()
             
-            # בדיקת גבולות
             total_pages = len(reader.pages)
+            
+            # התאמה לאינדקס 0-based
             start_idx = max(0, start_page - 1)
             end_idx = min(total_pages, end_page)
 
-            # הוספת העמודים הרלוונטיים
+            if start_idx >= end_idx:
+                return None
+
             for i in range(start_idx, end_idx):
                 writer.add_page(reader.pages[i])
 
-            # שמירה
             with open(output_filename, "wb") as f:
                 writer.write(f)
             
-            print(f"[DEBUG] Created sliced PDF: {output_filename} (Pages {start_page}-{end_page})")
             return output_filename
 
         except Exception as e:

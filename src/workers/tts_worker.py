@@ -37,7 +37,7 @@ class TTSWorker(QThread):
         
         # גיבוי לקולות
         self.he_voice = voice
-        self.en_voice = voice 
+        self.en_voice = "en-US-AriaNeural"
         
         # הגדרות ברירת מחדל למניעת קריסה
         self.user_max_limit = 15
@@ -330,10 +330,34 @@ class TTSWorker(QThread):
         return audio_segment
 
     async def generate_natural_audio(self, sentence, idx):
-        # (הלוגיקה שלך ל-dual mode נשארת זהה)
-        # רק וודא שאתה משתמש ב-fetch_audio_internal
-        # ושהחזרת ה-AudioSegment תקינה
-        return await self.process_single_sentence(sentence, idx) # הפנייה זמנית, תדביק את הלוגיקה המקורית אם יש לך
+        """
+        מפצל משפט לפי שפה (עברית/אנגלית) ומייצר אודיו עם הקול המתאים לכל חלק.
+        """
+        # פיצול: תופס רצפי אותיות לטיניות (כולל רווחים בין מילים אנגליות)
+        parts = re.split(r'([A-Za-z][A-Za-z\s\'\-\.]*[A-Za-z]|[A-Za-z]+)', sentence)
+
+        combined = AudioSegment.empty()
+        has_audio = False
+
+        for part in parts:
+            part_stripped = part.strip()
+            if not part_stripped:
+                continue
+
+            # בדיקה אם החלק מכיל אותיות לטיניות
+            is_english = bool(re.search(r'[A-Za-z]', part_stripped))
+            voice = self.en_voice if is_english else self.he_voice
+
+            audio_bytes = await self.fetch_audio_internal(part_stripped, voice, idx)
+            if audio_bytes:
+                segment = await self.loop.run_in_executor(None, self.bytes_to_audio, audio_bytes, idx)
+                if len(segment) > 0:
+                    combined += segment
+                    has_audio = True
+
+        if has_audio:
+            return combined
+        return AudioSegment.silent(duration=0, frame_rate=24000)
 
 
 class AudioPreviewWorker(QThread):
