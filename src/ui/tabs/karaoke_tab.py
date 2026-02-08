@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QComboBox,
                              QMessageBox, QFrame, QSplitter, QTreeWidget, QTreeWidgetItem)
@@ -13,6 +14,32 @@ from datetime import datetime
 from src.ui.widgets.pdf_viewer import PDFViewerWidget
 from src.ui.widgets.jump_slider import JumpSlider
 from src.ui.dialogs.split_dialog import KaraokeStyleDialog
+from src.ui.dialogs.transcription_dialog import TranscriptionDialog
+from src.workers.telegram_worker import TelegramWorker
+from src.workers.transcription_worker import TranscriptionWorker
+
+# סיומות אודיו נתמכות
+AUDIO_EXTENSIONS = (".mp3", ".m4a")
+
+
+def _find_audio_file(base_path):
+    """מוצא קובץ אודיו תואם (mp3 או m4a) לפי שם בסיס בלי סיומת"""
+    for ext in AUDIO_EXTENSIONS:
+        path = base_path + ext
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _is_audio_file(filepath):
+    """בודק אם הקובץ הוא קובץ אודיו נתמך"""
+    return filepath.lower().endswith(AUDIO_EXTENSIONS)
+
+
+def _get_audio_path_from_json(json_path):
+    """מוצא קובץ אודיו תואם לקובץ JSON"""
+    base = os.path.splitext(json_path)[0]
+    return _find_audio_file(base)
 
 
 class KaraokeTab(QWidget):
@@ -366,41 +393,55 @@ class KaraokeTab(QWidget):
     # === ייבוא פרויקטים (החלק שהיה חסר) ===
 
     def import_external_project(self):
-        """ייבוא פרויקטים - תומך בבחירת מספר קבצים"""
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "בחר קבצי MP3 או JSON", "", "Project Files (*.json *.mp3)")
+        """ייבוא פרויקטים - תומך בבחירת מספר קבצים (אודיו בלי JSON מותר)"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "בחר קבצי אודיו או JSON", "",
+            "Audio & Project Files (*.mp3 *.m4a *.json);;MP3 (*.mp3);;M4A (*.m4a);;JSON (*.json)"
+        )
         if not file_paths:
             return
 
         imported = 0
         skipped = 0
+        first_imported_path = None
+
         for file_path in file_paths:
             base_name = os.path.splitext(os.path.basename(file_path))[0]
             dir_name = os.path.dirname(file_path)
+            base_path = os.path.join(dir_name, base_name)
 
-            source_mp3 = os.path.join(dir_name, base_name + ".mp3")
-            source_json = os.path.join(dir_name, base_name + ".json")
-
-            if not os.path.exists(source_mp3) or not os.path.exists(source_json):
+            if file_path.endswith(".json"):
+                # JSON נבחר - חייב קובץ אודיו תואם
+                audio = _find_audio_file(base_path)
+                if not audio:
+                    skipped += 1
+                    continue
+            elif _is_audio_file(file_path):
+                # קובץ אודיו - תמיד מותר (גם בלי JSON)
+                if not os.path.exists(file_path):
+                    skipped += 1
+                    continue
+            else:
                 skipped += 1
                 continue
 
-            # במקום להעתיק - פשוט עוקבים אחרי התיקייה
             self.track_directory(dir_name)
             imported += 1
+            if first_imported_path is None:
+                source_json = os.path.join(dir_name, base_name + ".json")
+                if os.path.exists(source_json):
+                    first_imported_path = source_json
+                else:
+                    first_imported_path = file_path
 
         self.refresh_file_list()
 
-        if imported > 0:
-            # בחירת הפרויקט הראשון שיובא
-            first_base = os.path.splitext(os.path.basename(file_paths[0]))[0]
-            first_dir = os.path.dirname(file_paths[0])
-            first_json = os.path.join(first_dir, first_base + ".json")
-            if os.path.exists(first_json):
-                self.select_file_by_path(first_json)
+        if imported > 0 and first_imported_path:
+            self.select_file_by_path(first_imported_path)
 
         msg = f"יובאו {imported} פרויקטים."
         if skipped > 0:
-            msg += f"\n{skipped} קבצים דולגו (חסר MP3 או JSON)."
+            msg += f"\n{skipped} קבצים דולגו."
         QMessageBox.information(self, "ייבוא", msg)
 
     # === ניהול קבצים סטנדרטי ===
@@ -424,22 +465,40 @@ class KaraokeTab(QWidget):
             self._save_tracked_dirs()
 
     def _collect_all_projects(self):
-        """איסוף כל הפרויקטים מכל התיקיות המנוטרות"""
+        """איסוף כל הפרויקטים מכל התיקיות המנוטרות.
+        מחזיר רשימת tuples: (filename, full_path, mod_time, has_json)
+        - פרויקטים עם JSON: הנתיב הוא לקובץ JSON
+        - אודיו בלי JSON: הנתיב הוא לקובץ האודיו (mp3/m4a)
+        """
         files = []
-        seen_paths = set()
+        seen_bases = set()  # מעקב לפי base name למניעת כפילויות
         for directory in list(self.tracked_dirs):
             if not os.path.exists(directory):
                 continue
             for f in os.listdir(directory):
+                base_name = os.path.splitext(f)[0]
+                base_key = os.path.normpath(os.path.join(directory, base_name))
+                if base_key in seen_bases:
+                    continue
+
                 if f.endswith(".json"):
                     full_path = os.path.join(directory, f)
-                    norm_path = os.path.normpath(full_path)
-                    if norm_path in seen_paths:
-                        continue
-                    seen_paths.add(norm_path)
-                    if os.path.exists(full_path.replace(".json", ".mp3")):
+                    base_path = os.path.splitext(full_path)[0]
+                    audio = _find_audio_file(base_path)
+                    if audio:
+                        seen_bases.add(base_key)
                         mod_time = os.path.getmtime(full_path)
-                        files.append((f, full_path, mod_time))
+                        files.append((f, full_path, mod_time, True))
+
+                elif _is_audio_file(f):
+                    json_path = os.path.join(directory, base_name + ".json")
+                    if not os.path.exists(json_path):
+                        # אודיו ללא JSON - פרויקט חיצוני
+                        full_path = os.path.join(directory, f)
+                        seen_bases.add(base_key)
+                        mod_time = os.path.getmtime(full_path)
+                        files.append((f, full_path, mod_time, False))
+
         files.sort(key=lambda x: x[2], reverse=True)
         return files
 
@@ -464,9 +523,29 @@ class KaraokeTab(QWidget):
         return True
 
     def refresh_file_list(self):
+        # שמירת מצב פתוח/סגור של תיקיות ובחירה נוכחית
+        expanded_folders = set()
+        selected_path = None
+        root = self.list_files.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            folder_name = item.data(0, Qt.UserRole + 2)
+            if folder_name and item.isExpanded():
+                expanded_folders.add(folder_name)
+            if item.data(0, Qt.UserRole + 1) == "unsorted_group" and item.isExpanded():
+                expanded_folders.add("__unsorted__")
+        current = self.list_files.currentItem()
+        if current:
+            selected_path = current.data(0, Qt.UserRole)
+
         self.list_files.clear()
 
         all_files = self._collect_all_projects()
+
+        # טעינת שמות תצוגה מותאמים
+        custom_names = {}
+        if self.main_window and hasattr(self.main_window, 'settings'):
+            custom_names = self.main_window.settings.get("project_display_names", {})
 
         # מיפוי קבצים שמשויכים לתיקיות וירטואליות
         files_in_virtual = set()
@@ -484,22 +563,32 @@ class KaraokeTab(QWidget):
             folder_item.setFont(0, font)
             folder_item.setForeground(0, QColor("#3498DB"))
             self.list_files.addTopLevelItem(folder_item)
-            folder_item.setExpanded(True)
+            # שחזור מצב פתוח (ברירת מחדל: פתוח)
+            folder_item.setExpanded(folder_name in expanded_folders or len(expanded_folders) == 0)
 
             for fpath in self.virtual_folders[folder_name]:
                 if not os.path.exists(fpath):
                     continue
-                # סינון לפי תאריך גם בתוך תיקיות
                 try:
                     ftime = os.path.getmtime(fpath)
                     if not self._passes_date_filter(ftime):
                         continue
                 except:
                     pass
-                display_name = os.path.splitext(os.path.basename(fpath))[0]
+                norm_fp = os.path.normpath(fpath)
+                # בדיקה אם אודיו בלי JSON
+                is_audio_only = _is_audio_file(fpath) and not os.path.exists(os.path.splitext(fpath)[0] + ".json")
+                base_display = custom_names.get(norm_fp, os.path.splitext(os.path.basename(fpath))[0])
+                display_name = f"🎵 {base_display}" if is_audio_only else base_display
                 file_item = QTreeWidgetItem([display_name])
                 file_item.setData(0, Qt.UserRole, fpath)
+                file_item.setData(0, Qt.UserRole + 3, not is_audio_only)
                 file_item.setToolTip(0, fpath)
+                if is_audio_only:
+                    font = file_item.font(0)
+                    font.setItalic(True)
+                    file_item.setFont(0, font)
+                    file_item.setForeground(0, QColor("#95A5A6"))
                 folder_item.addChild(file_item)
 
         # קבצים שאינם בתיקיות וירטואליות - תחת "כללי"
@@ -510,30 +599,36 @@ class KaraokeTab(QWidget):
         unsorted_item.setFont(0, font)
         unsorted_item.setForeground(0, QColor("#F1C40F"))
 
-        for fname, fpath, ftime in all_files:
+        for fname, fpath, ftime, has_json in all_files:
             norm_fpath = os.path.normpath(fpath)
             if norm_fpath in files_in_virtual:
                 continue
             if not self._passes_date_filter(ftime):
                 continue
 
-            display_name = os.path.splitext(fname)[0]
+            base_display = custom_names.get(norm_fpath, os.path.splitext(fname)[0])
+            if not has_json:
+                display_name = f"🎵 {base_display}"
+            else:
+                display_name = base_display
             file_item = QTreeWidgetItem([display_name])
             file_item.setData(0, Qt.UserRole, fpath)
+            file_item.setData(0, Qt.UserRole + 3, has_json)  # סימון אם יש JSON
             file_item.setToolTip(0, fpath)
+            if not has_json:
+                font = file_item.font(0)
+                font.setItalic(True)
+                file_item.setFont(0, font)
+                file_item.setForeground(0, QColor("#95A5A6"))
             unsorted_item.addChild(file_item)
 
         if unsorted_item.childCount() > 0:
             self.list_files.addTopLevelItem(unsorted_item)
-            unsorted_item.setExpanded(True)
+            unsorted_item.setExpanded("__unsorted__" in expanded_folders or len(expanded_folders) == 0)
 
-        # ניקוי תיקיות וירטואליות ריקות (מהתצוגה, לא מההגדרות)
-        root = self.list_files.invisibleRootItem()
-        for i in reversed(range(root.childCount())):
-            item = root.child(i)
-            if item.data(0, Qt.UserRole + 1) == "virtual_folder" and item.childCount() == 0:
-                # תיקייה ריקה אחרי סינון - עדיין מציגים אותה
-                pass
+        # שחזור בחירה נוכחית
+        if selected_path:
+            self._restore_selection(selected_path)
 
     def on_file_selected(self, item, column=0):
         # אם לחצו על כותרת קבוצה/תיקייה - פתח/סגור
@@ -541,15 +636,30 @@ class KaraokeTab(QWidget):
             item.setExpanded(not item.isExpanded())
             return
         # בדיקה שיש נתיב קובץ
-        json_path = item.data(0, Qt.UserRole)
-        if not json_path:
+        file_path = item.data(0, Qt.UserRole)
+        if not file_path:
             item.setExpanded(not item.isExpanded())
             return
 
         self.save_progress()
         self.marked_errors.clear()
 
-        mp3_path = json_path.replace(".json", ".mp3")
+        # בדיקה אם זה קובץ אודיו בלי JSON
+        if _is_audio_file(file_path):
+            json_path = os.path.splitext(file_path)[0] + ".json"
+            if os.path.exists(json_path):
+                # JSON נוצר בינתיים (אחרי תמלול) - טען כרגיל
+                self.current_file_id = os.path.basename(json_path)
+                self.load_project(json_path, file_path)
+            else:
+                # אודיו בלי JSON - טען רק אודיו
+                self.current_file_id = os.path.basename(file_path)
+                self.load_mp3_only(file_path)
+            return
+
+        # טעינה רגילה (JSON + אודיו)
+        json_path = file_path
+        mp3_path = _get_audio_path_from_json(json_path) or json_path.replace(".json", ".mp3")
         pdf_path = json_path.replace(".json", ".pdf")
 
         self.current_file_id = os.path.basename(json_path)
@@ -583,6 +693,36 @@ class KaraokeTab(QWidget):
         except Exception as e: 
             print(f"Error loading project: {e}")
 
+    def load_mp3_only(self, mp3_path):
+        """טעינת MP3 ללא JSON - רק נגן אודיו, בלי סנכרון טקסט"""
+        try:
+            self.current_json_data = []
+            self.sentence_ranges = []
+            self.last_highlighted_index = -1
+            self.current_pdf_path = None
+
+            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(mp3_path)))
+
+            # הצגת הודעה בתצוגת הטקסט
+            self.text_display.clear()
+            cursor = self.text_display.textCursor()
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor("#95A5A6"))
+            fmt.setFontPointSize(16.0)
+            cursor.setCharFormat(fmt)
+            cursor.insertText("🎵 קובץ אודיו ללא תמלול\n\n")
+            fmt2 = QTextCharFormat()
+            fmt2.setForeground(QColor("#7F8C8D"))
+            fmt2.setFontPointSize(13.0)
+            cursor.setCharFormat(fmt2)
+            cursor.insertText("לחץ ימני על הקובץ בעץ ובחר \"🎙️ תמלל\"\nכדי ליצור תמלול אוטומטי עם טקסט מסונכרן.")
+
+            self.btn_play.setText("▶")
+            self.load_progress()
+
+        except Exception as e:
+            print(f"[ERROR] load_mp3_only: {e}")
+
     def manually_load_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "בחר PDF", "", "PDF Files (*.pdf)")
         if path:
@@ -612,6 +752,30 @@ class KaraokeTab(QWidget):
         root = self.list_files.invisibleRootItem()
         search_children(root)
 
+    def _restore_selection(self, path):
+        """שחזור בחירה נוכחית אחרי רענון"""
+        if not path:
+            return
+        target = os.path.normpath(path)
+        root = self.list_files.invisibleRootItem()
+        for i in range(root.childCount()):
+            parent = root.child(i)
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                child_path = child.data(0, Qt.UserRole)
+                if child_path and os.path.normpath(child_path) == target:
+                    self.list_files.setCurrentItem(child)
+                    return
+
+    def _get_selected_project_paths(self):
+        """מחזיר רשימת נתיבי JSON של כל הפרויקטים המסומנים"""
+        paths = []
+        for item in self.list_files.selectedItems():
+            json_path = item.data(0, Qt.UserRole)
+            if json_path:
+                paths.append(json_path)
+        return paths
+
     def show_file_context_menu(self, pos):
         item = self.list_files.itemAt(pos)
         if not item:
@@ -637,8 +801,64 @@ class KaraokeTab(QWidget):
         if not json_path:
             return
 
-        # תפריט לפרויקט (קובץ)
-        action_delete = menu.addAction("🗑️ מחק פרויקט")
+        # בדיקה כמה פרויקטים מסומנים
+        selected_paths = self._get_selected_project_paths()
+        is_batch = len(selected_paths) > 1
+
+        if is_batch:
+            # === תפריט batch למספר פרויקטים ===
+            action_download_mp3 = menu.addAction(f"💾 הורד {len(selected_paths)} קבצי אודיו")
+            action_download_pdf = menu.addAction(f"📄 הורד {len(selected_paths)} קבצי PDF")
+            action_telegram = menu.addAction(f"📤 שלח {len(selected_paths)} לטלגרם")
+            menu.addSeparator()
+
+            move_menu = menu.addMenu(f"📁 העבר {len(selected_paths)} לתיקייה")
+            action_no_folder = move_menu.addAction("── ללא תיקייה ──")
+            move_menu.addSeparator()
+            folder_actions = {}
+            for folder_name in sorted(self.virtual_folders.keys()):
+                action = move_menu.addAction(f"📁 {folder_name}")
+                folder_actions[action] = folder_name
+            move_menu.addSeparator()
+            action_new_folder = move_menu.addAction("➕ תיקייה חדשה...")
+
+            menu.addSeparator()
+            action_delete = menu.addAction(f"🗑️ מחק {len(selected_paths)} פרויקטים")
+
+            chosen = menu.exec_(self.list_files.mapToGlobal(pos))
+
+            if chosen == action_download_mp3:
+                self._batch_download(selected_paths, "audio")
+            elif chosen == action_download_pdf:
+                self._batch_download(selected_paths, "pdf")
+            elif chosen == action_telegram:
+                self._batch_send_telegram(selected_paths)
+            elif chosen == action_delete:
+                self._batch_delete(selected_paths)
+            elif chosen == action_no_folder:
+                for p in selected_paths:
+                    self._remove_from_all_folders(p)
+            elif chosen == action_new_folder:
+                name, ok = QInputDialog.getText(self, "תיקייה חדשה", "שם התיקייה:")
+                if ok and name.strip():
+                    name = name.strip()
+                    if name not in self.virtual_folders:
+                        self.virtual_folders[name] = []
+                    for p in selected_paths:
+                        self._move_to_folder(p, name)
+            elif chosen in folder_actions:
+                for p in selected_paths:
+                    self._move_to_folder(p, folder_actions[chosen])
+            return
+
+        # === תפריט רגיל לפרויקט בודד ===
+        action_transcribe = menu.addAction("🎙️ תמלל")
+        action_rename = menu.addAction("✏️ שנה שם פרויקט")
+        menu.addSeparator()
+        action_download_mp3 = menu.addAction("💾 הורד אודיו")
+        action_download_pdf = menu.addAction("📄 הורד PDF")
+        action_telegram = menu.addAction("📤 שלח לטלגרם")
+        menu.addSeparator()
 
         # תפריט "העבר לתיקייה"
         move_menu = menu.addMenu("📁 העבר לתיקייה")
@@ -651,9 +871,22 @@ class KaraokeTab(QWidget):
         move_menu.addSeparator()
         action_new_folder = move_menu.addAction("➕ תיקייה חדשה...")
 
+        menu.addSeparator()
+        action_delete = menu.addAction("🗑️ מחק פרויקט")
+
         chosen = menu.exec_(self.list_files.mapToGlobal(pos))
 
-        if chosen == action_delete:
+        if chosen == action_transcribe:
+            self._start_transcription(json_path)
+        elif chosen == action_rename:
+            self._rename_project(item, json_path)
+        elif chosen == action_download_mp3:
+            self._download_file(json_path, "audio")
+        elif chosen == action_download_pdf:
+            self._download_file(json_path, "pdf")
+        elif chosen == action_telegram:
+            self._send_to_telegram([json_path])
+        elif chosen == action_delete:
             self._delete_project(item, json_path)
         elif chosen == action_no_folder:
             self._remove_from_all_folders(json_path)
@@ -669,7 +902,7 @@ class KaraokeTab(QWidget):
             return
         try:
             base = os.path.splitext(json_path)[0]
-            for ext in [".json", ".mp3", ".pdf"]:
+            for ext in [".json", ".mp3", ".m4a", ".pdf"]:
                 fpath = base + ext
                 if os.path.exists(fpath):
                     os.remove(fpath)
@@ -680,6 +913,13 @@ class KaraokeTab(QWidget):
                 paths = self.virtual_folders[folder_name]
                 self.virtual_folders[folder_name] = [p for p in paths if os.path.normpath(p) != norm]
             self._save_virtual_folders()
+
+            # הסרה משמות מותאמים
+            if self.main_window and hasattr(self.main_window, 'settings'):
+                custom_names = self.main_window.settings.get("project_display_names", {})
+                custom_names.pop(norm, None)
+                self.main_window.settings["project_display_names"] = custom_names
+                self.main_window.save_settings()
 
             # הסרה מהעץ
             parent = item.parent()
@@ -757,6 +997,229 @@ class KaraokeTab(QWidget):
             if name not in self.virtual_folders:
                 self.virtual_folders[name] = []
             self._move_to_folder(json_path, name)
+
+    # === שינוי שם פרויקט ===
+    def _rename_project(self, item, json_path):
+        """שינוי שם תצוגה של פרויקט בעץ"""
+        current_name = item.text(0)
+        new_name, ok = QInputDialog.getText(self, "שינוי שם", "שם חדש:", text=current_name)
+        if ok and new_name.strip() and new_name.strip() != current_name:
+            new_name = new_name.strip()
+            norm_path = os.path.normpath(json_path)
+            # שמירת השם המותאם
+            if self.main_window and hasattr(self.main_window, 'settings'):
+                custom_names = self.main_window.settings.get("project_display_names", {})
+                custom_names[norm_path] = new_name
+                self.main_window.settings["project_display_names"] = custom_names
+                self.main_window.save_settings()
+            item.setText(0, new_name)
+
+    # === הורדת קבצים ===
+    def _download_file(self, file_path, file_type):
+        """הורדת אודיו או PDF - שמירה למיקום שנבחר"""
+        base = os.path.splitext(file_path)[0]
+        if file_type == "audio":
+            source = _find_audio_file(base)
+            if not source:
+                source = base + ".mp3"
+            ext = os.path.splitext(source)[1]
+            filter_str = f"Audio Files (*{ext})"
+        else:
+            source = base + ".pdf"
+            filter_str = "PDF Files (*.pdf)"
+
+        if not os.path.exists(source):
+            QMessageBox.warning(self, "לא נמצא", f"הקובץ {os.path.basename(source)} לא נמצא.")
+            return
+
+        default_name = os.path.basename(source)
+        dest_path, _ = QFileDialog.getSaveFileName(self, f"שמור {file_type.upper()}", default_name, filter_str)
+        if dest_path:
+            try:
+                shutil.copy2(source, dest_path)
+                QMessageBox.information(self, "הושלם", f"הקובץ נשמר ב:\n{dest_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "שגיאה", f"שגיאה בשמירה: {e}")
+
+    def _batch_download(self, file_paths, file_type):
+        """הורדת מספר קבצי אודיו או PDF לתיקייה נבחרת"""
+        label = "אודיו" if file_type == "audio" else "PDF"
+        dest_dir = QFileDialog.getExistingDirectory(self, f"בחר תיקייה לשמירת קבצי {label}")
+        if not dest_dir:
+            return
+
+        copied = 0
+        missing = 0
+        for fp in file_paths:
+            base = os.path.splitext(fp)[0]
+            if file_type == "audio":
+                source = _find_audio_file(base)
+            else:
+                source = base + ".pdf"
+                source = source if os.path.exists(source) else None
+
+            if source and os.path.exists(source):
+                try:
+                    shutil.copy2(source, os.path.join(dest_dir, os.path.basename(source)))
+                    copied += 1
+                except:
+                    pass
+            else:
+                missing += 1
+
+        msg = f"הועתקו {copied} קבצי {label} ל:\n{dest_dir}"
+        if missing > 0:
+            msg += f"\n{missing} קבצים לא נמצאו."
+        QMessageBox.information(self, "הושלם", msg)
+
+    # === שליחה לטלגרם ===
+    def _send_to_telegram(self, json_paths):
+        """שליחת פרויקטים לטלגרם (MP3 + PDF)"""
+        if not self.main_window or not hasattr(self.main_window, 'settings'):
+            QMessageBox.warning(self, "שגיאה", "לא ניתן לגשת להגדרות.")
+            return
+
+        token = self.main_window.settings.get("tg_token", "")
+        chat_id = self.main_window.settings.get("tg_chat_id", "")
+
+        if not token or not chat_id:
+            QMessageBox.warning(self, "טלגרם", "יש להגדיר Bot Token ו-Chat ID בהגדרות.")
+            return
+
+        files_to_send = []
+        for jp in json_paths:
+            base = os.path.splitext(jp)[0]
+            audio_path = _find_audio_file(base)
+            pdf_path = base + ".pdf"
+            if audio_path:
+                files_to_send.append((audio_path, "audio"))
+            if os.path.exists(pdf_path):
+                files_to_send.append((pdf_path, "document"))
+
+        if not files_to_send:
+            QMessageBox.warning(self, "טלגרם", "לא נמצאו קבצים לשליחה.")
+            return
+
+        self.tg_worker = TelegramWorker(token, chat_id, files_to_send)
+        self.tg_worker.log_update.connect(lambda msg: print(f"[TELEGRAM] {msg}"))
+        self.tg_worker.finished.connect(lambda: QMessageBox.information(self, "טלגרם", f"נשלחו {len(files_to_send)} קבצים לטלגרם."))
+        self.tg_worker.start()
+
+    def _batch_send_telegram(self, json_paths):
+        """שליחת מספר פרויקטים לטלגרם"""
+        self._send_to_telegram(json_paths)
+
+    # === מחיקה מרובה ===
+    def _batch_delete(self, json_paths):
+        """מחיקת מספר פרויקטים"""
+        if QMessageBox.question(self, "מחיקה",
+                                f"למחוק {len(json_paths)} פרויקטים?",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        for jp in json_paths:
+            try:
+                base = os.path.splitext(jp)[0]
+                for ext in [".json", ".mp3", ".m4a", ".pdf"]:
+                    fpath = base + ext
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                # הסרה מתיקיות וירטואליות
+                norm = os.path.normpath(jp)
+                for folder_name in list(self.virtual_folders.keys()):
+                    paths = self.virtual_folders[folder_name]
+                    self.virtual_folders[folder_name] = [p for p in paths if os.path.normpath(p) != norm]
+                # הסרה משמות מותאמים
+                if self.main_window and hasattr(self.main_window, 'settings'):
+                    custom_names = self.main_window.settings.get("project_display_names", {})
+                    custom_names.pop(norm, None)
+                    self.main_window.settings["project_display_names"] = custom_names
+            except Exception as e:
+                print(f"[ERROR] Delete project: {e}")
+
+        self._save_virtual_folders()
+        if self.main_window:
+            self.main_window.save_settings()
+        self.text_display.clear()
+        self.player.stop()
+        self.refresh_file_list()
+
+    # === תמלול ===
+    def _start_transcription(self, file_path):
+        """התחלת תמלול קובץ אודיו"""
+        # מציאת נתיב האודיו
+        if file_path.endswith(".json"):
+            base = os.path.splitext(file_path)[0]
+            mp3_path = _find_audio_file(base)
+            if not mp3_path:
+                mp3_path = base + ".mp3"
+        else:
+            mp3_path = file_path
+
+        if not os.path.exists(mp3_path):
+            QMessageBox.warning(self, "שגיאה", f"קובץ אודיו לא נמצא:\n{mp3_path}")
+            return
+
+        # הצגת דיאלוג הגדרות
+        default_model = "large"
+        default_lang = "he"
+        if self.main_window and hasattr(self.main_window, 'settings'):
+            default_model = self.main_window.settings.get("transcription_model", "large")
+            default_lang = self.main_window.settings.get("transcription_language", "he")
+
+        dlg = TranscriptionDialog(default_model, default_lang, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        settings = dlg.get_settings()
+
+        # עדכון שורת סטטוס
+        if self.main_window:
+            self.main_window.lbl_status.setText("🎙️ מתמלל...")
+            self.main_window.progress_bar.setValue(0)
+
+        # הפעלת worker
+        self._transcription_mp3_path = mp3_path
+        self.transcription_worker = TranscriptionWorker(
+            mp3_path, settings["model"], settings["language"]
+        )
+        self.transcription_worker.progress_update.connect(self._on_transcription_progress)
+        self.transcription_worker.log_update.connect(self._on_transcription_log)
+        self.transcription_worker.finished_success.connect(self._on_transcription_success)
+        self.transcription_worker.finished_error.connect(self._on_transcription_error)
+        self.transcription_worker.start()
+
+    def _on_transcription_progress(self, value):
+        if self.main_window:
+            self.main_window.progress_bar.setValue(value)
+
+    def _on_transcription_log(self, msg):
+        if self.main_window:
+            self.main_window.lbl_status.setText(f"🎙️ {msg}")
+        print(f"[TRANSCRIPTION] {msg}")
+
+    def _on_transcription_success(self, json_path, karaoke_data):
+        """callback כשתמלול הושלם בהצלחה"""
+        if self.main_window:
+            self.main_window.lbl_status.setText("✅ תמלול הושלם!")
+            self.main_window.progress_bar.setValue(100)
+
+        # רענון העץ וטעינת הפרויקט
+        self.refresh_file_list()
+
+        # טעינת הפרויקט המתומלל
+        self.select_file_by_path(json_path)
+
+        QMessageBox.information(self, "תמלול הושלם",
+                                f"התמלול הושלם בהצלחה!\n{len(karaoke_data)} קטעים זוהו.")
+
+    def _on_transcription_error(self, error_msg):
+        """callback כשתמלול נכשל"""
+        if self.main_window:
+            self.main_window.lbl_status.setText("❌ תמלול נכשל")
+            self.main_window.progress_bar.setValue(0)
+
+        QMessageBox.critical(self, "שגיאת תמלול", error_msg)
 
     # --- טעינת טקסט וסנכרון ---
     def reload_text_content(self):

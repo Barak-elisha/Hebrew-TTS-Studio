@@ -1,3 +1,4 @@
+import torch  # <--- הוסף שורה זו ראשונה! חובה למניעת Bus Error ב-Mac
 import sys
 import os
 import hashlib
@@ -29,7 +30,9 @@ DEFAULT_SETTINGS = {
     "pause_sentence": 600,
     "max_concurrent": 50,
     "custom_symbols": {"***": 1000},
-    "nikud_dictionary": {}
+    "nikud_dictionary": {},
+    "transcription_model": "large",
+    "transcription_language": "he"
 }
 
 class HebrewTTSStudio(QMainWindow):

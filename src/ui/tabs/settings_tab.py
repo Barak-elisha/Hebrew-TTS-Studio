@@ -1,5 +1,5 @@
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
-                             QGroupBox, QLabel, QLineEdit, QSpinBox, 
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+                             QGroupBox, QLabel, QLineEdit, QSpinBox, QComboBox,
                              QTableWidget, QTableWidgetItem, QHeaderView, QPushButton)
 from PyQt5.QtCore import Qt
 
@@ -82,7 +82,25 @@ class SettingsTab(QWidget):
         layout_symbols.addLayout(btn_layout)
         
         layout.addWidget(group_symbols)
-        
+
+        # --- קבוצה 5: תמלול ---
+        group_transcription = QGroupBox("🎙️ תמלול (Whisper)")
+        layout_trans = QGridLayout(group_transcription)
+
+        layout_trans.addWidget(QLabel("מודל ברירת מחדל:"), 0, 0)
+        self.combo_trans_model = QComboBox()
+        self.combo_trans_model.addItems(["large", "medium", "small", "base", "tiny"])
+        layout_trans.addWidget(self.combo_trans_model, 0, 1)
+
+        layout_trans.addWidget(QLabel("שפה:"), 1, 0)
+        self.combo_trans_lang = QComboBox()
+        self.combo_trans_lang.addItem("עברית", "he")
+        self.combo_trans_lang.addItem("אנגלית", "en")
+        self.combo_trans_lang.addItem("זיהוי אוטומטי", "auto")
+        layout_trans.addWidget(self.combo_trans_lang, 1, 1)
+
+        layout.addWidget(group_transcription)
+
         # כפתור שמירה ידני (לנוחות)
         btn_save = QPushButton("💾 שמור הגדרות")
         btn_save.setStyleSheet("background-color: #27AE60; color: white; font-weight: bold; padding: 10px;")
@@ -110,6 +128,18 @@ class SettingsTab(QWidget):
         for sym, dur in custom_symbols.items():
             self.add_row_ui(sym, dur)
 
+        # טעינת הגדרות תמלול
+        trans_model = settings.get("transcription_model", "large")
+        idx = self.combo_trans_model.findText(trans_model)
+        if idx >= 0:
+            self.combo_trans_model.setCurrentIndex(idx)
+
+        trans_lang = settings.get("transcription_language", "he")
+        for i in range(self.combo_trans_lang.count()):
+            if self.combo_trans_lang.itemData(i) == trans_lang:
+                self.combo_trans_lang.setCurrentIndex(i)
+                break
+
     def apply_settings_to_memory(self):
         """מעדכן את אובייקט ההגדרות הראשי מהשדות בטאב"""
         if not self.main_window: return
@@ -132,6 +162,10 @@ class SettingsTab(QWidget):
                     new_symbols[sym_item.text()] = int(dur_item.text())
                 except: pass
         s["custom_symbols"] = new_symbols
+
+        # הגדרות תמלול
+        s["transcription_model"] = self.combo_trans_model.currentText()
+        s["transcription_language"] = self.combo_trans_lang.currentData() or "he"
 
     def force_save(self):
         """שמירה יזומה ע'י המשתמש"""
